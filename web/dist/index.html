@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>mac-monitor</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="/app.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <strong id="host">mac-monitor</strong>
+        <span id="machine" class="muted"></span>
+      </div>
+      <div class="controls" role="toolbar" aria-label="Time range">
+        <div id="presets" class="segmented"></div>
+        <button type="button" id="custom-btn" class="ghost">Custom…</button>
+        <span id="custom-label" class="custom-label"></span>
+        <button type="button" id="reset-zoom" class="ghost" hidden>Reset zoom</button>
+      </div>
+      <div class="meta">
+        <span id="status" class="status-text" role="status" aria-live="polite"></span>
+        <button type="button" id="theme" class="ghost">Theme: auto</button>
+        <span id="version" class="muted"></span>
+      </div>
+    </header>
+    <main id="app">
+      <p class="muted pad">Loading…</p>
+    </main>
+    <dialog id="range-dialog">
+      <form id="range-form" method="dialog">
+        <h3>Custom range</h3>
+        <label>From <input type="datetime-local" id="range-from" required /></label>
+        <label>To <input type="datetime-local" id="range-to" required /></label>
+        <div class="dialog-actions">
+          <button value="cancel" class="ghost" formnovalidate>Cancel</button>
+          <button value="apply" class="primary">Apply</button>
+        </div>
+      </form>
+    </dialog>
+    <script src="/app.js" defer></script>
+  </body>
+</html>
