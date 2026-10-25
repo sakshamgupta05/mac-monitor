@@ -1,5 +1,6 @@
 mod catalog;
 mod collector;
+mod config;
 mod launchd;
 mod server;
 mod store;
@@ -13,10 +14,14 @@ use tokio::sync::watch;
 
 use collector::alerts::AlertConfig;
 use collector::{Collector, CollectorConfig, Shared};
+use config::{Config, Options, Source};
 use store::{Retention, Store};
 
 /// Low-overhead system monitor for Apple Silicon Macs: records power, CPU/GPU, memory,
 /// thermals, I/O and per-process usage, and serves a dashboard.
+///
+/// Options are read from ~/.config/mac-monitor/config.yaml; flags and environment
+/// variables override the file.
 #[derive(Parser)]
 #[command(name = "mac-monitor", version, args_conflicts_with_subcommands = true)]
 struct Cli {
@@ -30,88 +35,69 @@ struct Cli {
 enum Cmd {
   /// Record metrics and serve the dashboard (the default)
   Serve(ServeArgs),
-  /// Install a LaunchAgent that runs `serve` at login with these options
+  /// Install a LaunchAgent that runs `serve` at login; options given here are saved to the config file
   Install(ServeArgs),
-  /// Stop and remove the LaunchAgent (recorded data is kept)
+  /// Stop and remove the LaunchAgent (recorded data and the config file are kept)
   Uninstall,
-  /// Show whether the LaunchAgent and server are running
+  /// Restart the LaunchAgent, e.g. after editing the config file
+  Restart {
+    #[command(flatten)]
+    file: ConfigArgs,
+  },
+  /// Show whether the LaunchAgent and server are running, and which config file applies
   Status {
-    #[arg(long, env = "MAC_MONITOR_LISTEN", default_value = DEFAULT_LISTEN)]
-    listen: String,
+    #[command(flatten)]
+    file: ConfigArgs,
+    #[arg(long, env = "MAC_MONITOR_LISTEN")]
+    listen: Option<String>,
   },
 }
 
-const DEFAULT_LISTEN: &str = "127.0.0.1:9393";
+#[derive(Args, Clone, Debug)]
+struct ConfigArgs {
+  /// Config file [default: ~/.config/mac-monitor/config.yaml]
+  #[arg(long, env = "MAC_MONITOR_CONFIG", conflicts_with = "no_config")]
+  config: Option<PathBuf>,
+  /// Ignore the config file
+  #[arg(long)]
+  no_config: bool,
+}
+
+impl ConfigArgs {
+  fn source(&self) -> Option<Source> {
+    (!self.no_config).then(|| Source::locate(self.config.as_deref()))
+  }
+
+  /// The config file's options (empty with `--no-config` or no file).
+  fn read(&self) -> Result<Options, String> {
+    Ok(self.source().map(|s| s.read()).transpose()?.flatten().unwrap_or_default())
+  }
+
+  fn describe(&self) -> String {
+    match self.source() {
+      None => "none (--no-config)".into(),
+      Some(s) if s.path.exists() => s.path.display().to_string(),
+      Some(s) => format!("{} (not found, using defaults)", s.path.display()),
+    }
+  }
+}
 
 #[derive(Args, Clone, Debug)]
 struct ServeArgs {
-  /// Address to serve the dashboard on
-  #[arg(long, env = "MAC_MONITOR_LISTEN", default_value = DEFAULT_LISTEN)]
-  listen: String,
-  /// Where the database lives [default: ~/Library/Application Support/mac-monitor]
-  #[arg(long, env = "MAC_MONITOR_DATA_DIR")]
-  data_dir: Option<PathBuf>,
-  /// Sampling interval in milliseconds
-  #[arg(long, default_value_t = 2000, value_parser = clap::value_parser!(u64).range(250..=15000))]
-  sample_ms: u64,
-  /// Sampling interval while a live view is open
-  #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u64).range(250..=15000))]
-  live_sample_ms: u64,
-  /// Days to keep 15-second resolution data
-  #[arg(long, default_value_t = 14, value_parser = clap::value_parser!(u32).range(1..))]
-  raw_retention_days: u32,
-  /// Days to keep 5-minute resolution data and events
-  #[arg(long, default_value_t = 365, value_parser = clap::value_parser!(u32).range(1..))]
-  retention_days: u32,
-  /// Alert when CPU temperature stays above this many °C for 2 minutes
-  #[arg(long, default_value_t = 100.0)]
-  alert_cpu_temp: f32,
-  /// Alert when free disk space drops below this many GB
-  #[arg(long, default_value_t = 10.0)]
-  alert_disk_free_gb: f32,
-  /// Show macOS notifications when alerts fire
-  #[arg(long)]
-  notify: bool,
-  /// Also send alerts to this ntfy topic URL (e.g. https://ntfy.sh/my-topic)
-  #[arg(long)]
-  ntfy_url: Option<String>,
+  #[command(flatten)]
+  file: ConfigArgs,
+  #[command(flatten)]
+  opts: Options,
 }
 
 impl ServeArgs {
-  fn data_dir(&self) -> PathBuf {
-    self.data_dir.clone().unwrap_or_else(|| {
-      let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-      PathBuf::from(home).join("Library/Application Support/mac-monitor")
+  /// Flags and environment over the config file over defaults.
+  fn resolve(&self) -> Result<Config, String> {
+    // clap checks flag values, so a range error comes from the file
+    Config::resolve(self.opts.clone().or(self.file.read()?)).map_err(|e| match self.file.source() {
+      Some(s) => format!("{}: {e}", s.path.display()),
+      None => e,
     })
-  }
-
-  /// The options as command-line arguments, for the LaunchAgent.
-  fn to_args(&self) -> Vec<String> {
-    let mut a = vec![
-      "--listen".into(),
-      self.listen.clone(),
-      "--data-dir".into(),
-      self.data_dir().to_string_lossy().into(),
-      "--sample-ms".into(),
-      self.sample_ms.to_string(),
-      "--live-sample-ms".into(),
-      self.live_sample_ms.to_string(),
-      "--raw-retention-days".into(),
-      self.raw_retention_days.to_string(),
-      "--retention-days".into(),
-      self.retention_days.to_string(),
-      "--alert-cpu-temp".into(),
-      self.alert_cpu_temp.to_string(),
-      "--alert-disk-free-gb".into(),
-      self.alert_disk_free_gb.to_string(),
-    ];
-    if self.notify {
-      a.push("--notify".into());
-    }
-    if let Some(url) = &self.ntfy_url {
-      a.extend(["--ntfy-url".into(), url.clone()]);
-    }
-    a
   }
 }
 
@@ -120,9 +106,10 @@ fn main() {
   let result = match cli.cmd {
     None => serve(cli.serve),
     Some(Cmd::Serve(args)) => serve(args),
-    Some(Cmd::Install(args)) => launchd::install(args.to_args(), &args.listen),
+    Some(Cmd::Install(args)) => install(args),
     Some(Cmd::Uninstall) => launchd::uninstall(),
-    Some(Cmd::Status { listen }) => launchd::status(&listen),
+    Some(Cmd::Restart { file }) => restart(file),
+    Some(Cmd::Status { file, listen }) => status(file, listen),
   };
   if let Err(e) = result {
     eprintln!("mac-monitor: {e}");
@@ -130,8 +117,64 @@ fn main() {
   }
 }
 
+/// Saves any options given into the config file (creating it if needed) and points the
+/// LaunchAgent at it. The plist holds no options, so reinstalling never loses settings.
+fn install(mut args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
+  if args.file.no_config {
+    return Err("install needs a config file; drop --no-config".into());
+  }
+  let source = args.file.source().unwrap();
+  // launchd runs from /, so store an absolute data directory
+  if let Some(dir) = &args.opts.data_dir {
+    let dir = config::expand_tilde(dir);
+    args.opts.data_dir = Some(if dir.is_relative() { std::env::current_dir()?.join(dir) } else { dir });
+  }
+  if args.opts == Options::default() {
+    if config::ensure_exists(&source.path)? {
+      println!("Created {} (all options at their defaults)", source.path.display());
+    }
+  } else {
+    let existed = source.path.exists();
+    let keys = config::save(&source.path, &args.opts)?;
+    let verb = if existed { "Updated" } else { "Created" };
+    println!("{verb} {} ({})", source.path.display(), keys.join(", "));
+  }
+  // Check the whole file before handing it to launchd.
+  let cfg = ServeArgs { file: args.file.clone(), opts: Options::default() }.resolve()?;
+
+  // Pass the path only if launchd would not find it by itself (it has no XDG_CONFIG_HOME).
+  let home_default = config::home().join(".config/mac-monitor/config.yaml");
+  let mut serve_args = Vec::new();
+  if source.path != home_default {
+    let path = std::path::absolute(&source.path)?;
+    serve_args.extend(["--config".to_string(), path.to_string_lossy().into()]);
+  }
+  launchd::install(serve_args, &cfg.listen)
+}
+
+fn restart(file: ConfigArgs) -> Result<(), Box<dyn std::error::Error>> {
+  // Catch config mistakes here rather than in a launchd restart loop.
+  ServeArgs { file, opts: Options::default() }.resolve()?;
+  launchd::restart()
+}
+
+fn status(file: ConfigArgs, listen: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+  let args = ServeArgs { file, opts: Options { listen, ..Default::default() } };
+  println!("Config: {}", args.file.describe());
+  let listen = match args.resolve() {
+    Ok(cfg) => cfg.listen,
+    Err(e) => {
+      println!("Config error: {e}");
+      args.opts.listen.unwrap_or_else(|| config::DEFAULT_LISTEN.into())
+    }
+  };
+  launchd::status(&listen)
+}
+
 fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
-  let data_dir = args.data_dir();
+  let config_file = args.file.describe();
+  let args = args.resolve()?;
+  let data_dir = args.data_dir.clone();
   std::fs::create_dir_all(&data_dir)?;
   let retention = Retention {
     raw_secs: args.raw_retention_days as i64 * 86400,
@@ -172,7 +215,7 @@ fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     shutdown: shutdown_rx,
   };
 
-  eprintln!("mac-monitor {} listening on http://{}/", env!("CARGO_PKG_VERSION"), args.listen);
+  eprintln!("mac-monitor {} listening on http://{}/ (config: {config_file})", env!("CARGO_PKG_VERSION"), args.listen);
   let rt = tokio::runtime::Builder::new_current_thread().enable_io().enable_time().build()?;
   rt.block_on(async move {
     let listener = tokio::net::TcpListener::from_std(listener)?;

@@ -9,9 +9,7 @@ use std::time::Duration;
 
 pub const LABEL: &str = "io.github.mac-monitor";
 
-fn home() -> PathBuf {
-  PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
-}
+use crate::config::home;
 
 pub fn plist_path() -> PathBuf {
   home().join("Library/LaunchAgents").join(format!("{LABEL}.plist"))
@@ -97,7 +95,7 @@ pub fn install(serve_args: Vec<String>, listen: &str) -> Result<(), Box<dyn std:
   }
 
   println!("Installed {}", path.display());
-  println!("mac-monitor now starts at login. Dashboard: http://{listen}/");
+  println!("mac-monitor now starts at login. Dashboard: {}", url(listen));
   println!("Logs: {}", log_path().display());
   Ok(())
 }
@@ -112,8 +110,37 @@ pub fn uninstall() -> Result<(), Box<dyn std::error::Error>> {
   } else {
     println!("Not installed ({} not found)", path.display());
   }
-  println!("Recorded data is kept; delete the data directory to remove it.");
+  println!("Recorded data and the config file are kept; delete them to remove everything.");
   Ok(())
+}
+
+pub fn restart() -> Result<(), Box<dyn std::error::Error>> {
+  let target = format!("{}/{LABEL}", domain());
+  let out = launchctl(&["kickstart", "-k", &target])?;
+  if !out.status.success() {
+    if !launchctl(&["print", &target]).is_ok_and(|o| o.status.success()) {
+      return Err("the LaunchAgent is not loaded; run `mac-monitor install`".into());
+    }
+    return Err(format!("launchctl kickstart failed: {}", String::from_utf8_lossy(&out.stderr).trim()).into());
+  }
+  println!("Restarted {LABEL}");
+  Ok(())
+}
+
+/// Where to reach a listen address from this machine (a wildcard address means loopback works).
+fn local_addr(listen: &str) -> String {
+  if let Some(port) = listen.strip_prefix("0.0.0.0:") {
+    format!("127.0.0.1:{port}")
+  } else if let Some(port) = listen.strip_prefix("[::]:") {
+    format!("[::1]:{port}")
+  } else {
+    listen.to_string()
+  }
+}
+
+fn url(listen: &str) -> String {
+  let local = local_addr(listen);
+  if local == listen { format!("http://{listen}/") } else { format!("http://{local}/ (listening on {listen})") }
 }
 
 fn http_get(addr: &str, path: &str) -> Option<String> {
@@ -140,9 +167,9 @@ pub fn status(listen: &str) -> Result<(), Box<dyn std::error::Error>> {
   } else {
     println!("LaunchAgent: not installed");
   }
-  match http_get(listen, "/api/health") {
-    Some(body) => println!("Server http://{listen}/: {}", body.trim()),
-    None => println!("Server http://{listen}/: not reachable"),
+  match http_get(&local_addr(listen), "/api/health") {
+    Some(body) => println!("Server {}: {}", url(listen), body.trim()),
+    None => println!("Server {}: not reachable", url(listen)),
   }
   Ok(())
 }
@@ -157,5 +184,13 @@ mod tests {
     assert!(p.contains("<string>https://x/?a=1&amp;b=2</string>"));
     assert!(p.contains("<string>Background</string>"));
     assert!(p.contains(&format!("<string>{LABEL}</string>")));
+  }
+
+  #[test]
+  fn wildcard_listen_is_reached_on_loopback() {
+    assert_eq!(local_addr("0.0.0.0:9393"), "127.0.0.1:9393");
+    assert_eq!(local_addr("[::]:9393"), "[::1]:9393");
+    assert_eq!(local_addr("100.70.206.42:9393"), "100.70.206.42:9393");
+    assert_eq!(url("127.0.0.1:9393"), "http://127.0.0.1:9393/");
   }
 }

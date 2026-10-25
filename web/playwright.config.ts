@@ -15,7 +15,7 @@ export default defineConfig({
   reporter: [["list"]],
   use: { baseURL: `http://127.0.0.1:${port}`, viewport: { width: 1440, height: 900 }, trace: "retain-on-failure" },
   webServer: {
-    command: `${bin} --listen 127.0.0.1:${port} --data-dir ${dataDir}`,
+    command: `${bin} --no-config --listen 127.0.0.1:${port} --data-dir ${dataDir}`,
     url: `http://127.0.0.1:${port}/api/health`,
     reuseExistingServer: false,
     timeout: 30_000,

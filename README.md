@@ -104,12 +104,14 @@ Use `make install PREFIX=/usr/local` to install elsewhere.
 
 `mac-monitor install` writes a LaunchAgent (`~/Library/LaunchAgents/io.github.mac-monitor.plist`)
 that starts `mac-monitor serve` at login, restarts it if it exits, and runs it as a background
-process (efficiency cores, throttled I/O). Options given to `install` are passed to `serve`:
+process (efficiency cores, throttled I/O). Options given to `install` are saved to the
+[config file](#config-file), so reinstalling or upgrading keeps them:
 
 ```sh
 mac-monitor install --notify --raw-retention-days 30
-mac-monitor status      # LaunchAgent state and server health
-mac-monitor uninstall   # stop and remove the LaunchAgent; recorded data is kept
+mac-monitor restart     # apply edits to the config file
+mac-monitor status      # LaunchAgent state, config file and server health
+mac-monitor uninstall   # stop and remove the LaunchAgent; recorded data and config are kept
 ```
 
 Logs go to `~/Library/Logs/mac-monitor.log`. To run in the foreground instead, run
@@ -130,10 +132,32 @@ on your tailnet:
 tailscale serve --bg 9393
 ```
 
-then open `https://<machine>.<tailnet>.ts.net/`. To listen on all interfaces instead, use
-`--listen 0.0.0.0:9393`. There is no authentication, so only do that on a network you trust.
+then open `https://<machine>.<tailnet>.ts.net/`. To listen on all interfaces instead, set
+`listen: "0.0.0.0:9393"` in the config file (or run `mac-monitor install --listen 0.0.0.0:9393`)
+and open `http://<machine>:9393/`. There is no authentication, so only do that on a network
+you trust.
 
 ## Options
+
+Options come from command-line flags, then environment variables, then the config file, then
+the defaults below.
+
+### Config file
+
+`~/.config/mac-monitor/config.yaml` (under `$XDG_CONFIG_HOME` if set; another file with
+`--config` or `MAC_MONITOR_CONFIG`). `mac-monitor install` creates it with every option
+commented out. Keys are the option names with underscores:
+
+```yaml
+listen: "0.0.0.0:9393"
+retention_days: 365
+notify: true
+ntfy_url: "https://ntfy.sh/my-topic"
+```
+
+It is read once at startup; run `mac-monitor restart` after editing it. Unknown keys and
+out-of-range values are errors, so a typo stops the server with a message in the log rather
+than being ignored. `--no-config` ignores the file.
 
 | Option | Default | |
 |---|---|---|
@@ -145,7 +169,7 @@ then open `https://<machine>.<tailnet>.ts.net/`. To listen on all interfaces ins
 | `--retention-days` | `365` | How long 5-minute data and events are kept |
 | `--alert-cpu-temp` | `100` | Alert when CPU temperature stays above this (°C) for 2 minutes |
 | `--alert-disk-free-gb` | `10` | Alert when free disk space drops below this |
-| `--notify` | off | Show alerts as macOS notifications |
+| `--notify` | off | Show alerts as macOS notifications (`--notify=false` turns it off) |
 | `--ntfy-url` | none | Also POST alerts to an ntfy topic, e.g. `https://ntfy.sh/my-topic` |
 
 The electricity price for the cost figures is set in the dashboard (stored in the browser).
