@@ -9,7 +9,6 @@ use serde::Deserialize;
 
 pub const DEFAULT_LISTEN: &str = "127.0.0.1:9393";
 const DEFAULT_SAMPLE_MS: u64 = 2000;
-const DEFAULT_LIVE_SAMPLE_MS: u64 = 1000;
 const DEFAULT_RAW_RETENTION_DAYS: u32 = 14;
 const DEFAULT_RETENTION_DAYS: u32 = 365;
 const DEFAULT_ALERT_CPU_TEMP: f32 = 100.0;
@@ -30,8 +29,8 @@ pub struct Options {
   /// Sampling interval in milliseconds [default: 2000]
   #[arg(long, value_parser = clap::value_parser!(u64).range(250..=15000))]
   pub sample_ms: Option<u64>,
-  /// Sampling interval while a live view is open [default: 1000]
-  #[arg(long, value_parser = clap::value_parser!(u64).range(250..=15000))]
+  /// Legacy option, accepted for compatibility but ignored; use --sample-ms.
+  #[arg(long, hide = true, value_parser = clap::value_parser!(u64).range(250..=15000))]
   pub live_sample_ms: Option<u64>,
   /// Days to keep 15-second resolution data [default: 14]
   #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
@@ -114,7 +113,6 @@ pub struct Config {
   pub listen: String,
   pub data_dir: PathBuf,
   pub sample_ms: u64,
-  pub live_sample_ms: u64,
   pub raw_retention_days: u32,
   pub retention_days: u32,
   pub alert_cpu_temp: f32,
@@ -130,7 +128,6 @@ impl Config {
       listen: o.listen.unwrap_or_else(|| DEFAULT_LISTEN.into()),
       data_dir: o.data_dir.map(|p| expand_tilde(&p)).unwrap_or_else(default_data_dir),
       sample_ms: o.sample_ms.unwrap_or(DEFAULT_SAMPLE_MS),
-      live_sample_ms: o.live_sample_ms.unwrap_or(DEFAULT_LIVE_SAMPLE_MS),
       raw_retention_days: o.raw_retention_days.unwrap_or(DEFAULT_RAW_RETENTION_DAYS),
       retention_days: o.retention_days.unwrap_or(DEFAULT_RETENTION_DAYS),
       alert_cpu_temp: o.alert_cpu_temp.unwrap_or(DEFAULT_ALERT_CPU_TEMP),
@@ -138,10 +135,8 @@ impl Config {
       notify: o.notify.unwrap_or(false),
       ntfy_url: o.ntfy_url.filter(|u| !u.is_empty()),
     };
-    for (key, v) in [("sample_ms", c.sample_ms), ("live_sample_ms", c.live_sample_ms)] {
-      if !SAMPLE_MS_RANGE.contains(&v) {
-        return Err(format!("{key} must be between 250 and 15000 (got {v})"));
-      }
+    if !SAMPLE_MS_RANGE.contains(&c.sample_ms) {
+      return Err(format!("sample_ms must be between 250 and 15000 (got {})", c.sample_ms));
     }
     for (key, v) in [("raw_retention_days", c.raw_retention_days), ("retention_days", c.retention_days)] {
       if v < 1 {
@@ -247,9 +242,8 @@ pub fn template() -> String {
 # Where the database lives.
 # data_dir: "~/Library/Application Support/mac-monitor"
 
-# Sampling interval in milliseconds (250-15000), and while a live view is open.
+# System sampling interval in milliseconds (250-15000), shared by all views.
 # sample_ms: {DEFAULT_SAMPLE_MS}
-# live_sample_ms: {DEFAULT_LIVE_SAMPLE_MS}
 
 # Days to keep 15-second data, and 5-minute data and events.
 # raw_retention_days: {DEFAULT_RAW_RETENTION_DAYS}
@@ -321,7 +315,7 @@ mod tests {
     let is_setting = |r: &&str| r.split_once(": ").is_some_and(|(k, _)| k.chars().all(|c| c.is_ascii_lowercase() || c == '_'));
     let template = template();
     let uncommented: Vec<&str> = template.lines().filter_map(|l| l.strip_prefix("# ").filter(is_setting)).collect();
-    assert_eq!(uncommented.len(), 10, "{uncommented:?}");
+    assert_eq!(uncommented.len(), 9, "{uncommented:?}");
     let mut o = parse(&uncommented.join("\n")).unwrap();
     o.ntfy_url = None; // the template shows an example, not the default
     let c = Config::resolve(o).unwrap();
@@ -338,11 +332,19 @@ mod tests {
     let c = Config::resolve(o).unwrap();
     assert_eq!(c.listen, "0.0.0.0:9393");
     assert_eq!(c.data_dir, home().join("mm"));
-    assert_eq!((c.sample_ms, c.live_sample_ms), (500, 250));
+    assert_eq!(c.sample_ms, 500);
     assert_eq!((c.raw_retention_days, c.retention_days), (30, 400));
     assert_eq!((c.alert_cpu_temp, c.alert_disk_free_gb), (95.5, 20.0));
     assert!(c.notify);
     assert_eq!(c.ntfy_url.as_deref(), Some("https://ntfy.sh/x"));
+  }
+
+  #[test]
+  fn legacy_live_interval_cannot_change_system_cadence() {
+    let c = Config::resolve(parse("live_sample_ms: 1000\n").unwrap()).unwrap();
+    assert_eq!(c.sample_ms, 2000);
+    let c = Config::resolve(parse("sample_ms: 3000\nlive_sample_ms: 250\n").unwrap()).unwrap();
+    assert_eq!(c.sample_ms, 3000);
   }
 
   #[test]

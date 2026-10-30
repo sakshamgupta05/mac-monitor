@@ -14,7 +14,7 @@ no runtime, no database server, no sudo.
 ## Features
 
 - **Power and energy.** System, CPU, GPU and Neural Engine power from back-to-back readings
-  (every 2 s, every 1 s while you watch live), so energy totals cover every second instead of
+  (every 2 s in all views), so energy totals cover every second instead of
   extrapolating from one scrape every 15 s. Energy per minute / hour / day / week, with cost at
   your electricity price.
 - **Nothing lost between points.** Each stored point keeps the average, minimum and maximum of
@@ -32,10 +32,24 @@ no runtime, no database server, no sudo.
   [ntfy](https://ntfy.sh) pushes.
 - **Long history, small disk.** 15-second resolution for 14 days, 5-minute resolution for a
   year (both configurable), in one compressed SQLite file.
-- **Live mode.** 1-second updates over Server-Sent Events while the live view is open.
+- **Live workspace.** Current CPU, memory, GPU, disk, network and power, with mini-charts for
+  the last 1, 2, 5 or 15 minutes and a sortable current process-group table. Filled mini-charts
+  show CPU/GPU against 0–100%, memory against physical RAM, and labeled rate/power scales.
+  Disk and network use compact mirrored directional areas around zero, with an Overlay option
+  for comparison. Both use a trailing 6-second average and a shared scale. Current readings
+  stay unsmoothed, and all displayed magnitudes remain positive. Live updates are
+  off by default on every page load. Enable them for streamed 2-second system samples and approximately
+  5-second process scans over one Server-Sent Events connection. Hiding the tab pauses its live
+  connection; process scanning returns to normal once the last live viewer disconnects.
+- **Independent history.** Historical ranges and their summary cards, charts, process averages,
+  peaks and events remain available below the live workspace. Changing a historical range does
+  not stop Live or change its chart window.
 - **Dashboard UX.** Time presets from 15 minutes to a year, custom ranges, drag to zoom, a
   crosshair synced across all charts, legends that read out values, table view and CSV export
-  for every chart, light and dark themes.
+  for every chart, light and dark themes. Historical time-series use thin outlines and subtle
+  area fills. Optional **Smooth trends** softens the drawn lines with a centered three-point
+  average; numeric readouts, min/max bands, tables, CSV and stored history stay unchanged.
+  Energy remains bars and pressure remains discrete states.
 - **Prometheus export.** `/metrics` for scraping by an existing Prometheus or VictoriaMetrics.
 
 ## Resource use
@@ -55,9 +69,10 @@ Disk use is estimated at ~3 MB per day for 15-second data (~40 MB kept over 14 d
 2.8 MB.
 
 While no browser is connected the HTTP server does no work at all. The recurring cost is the
-sampler, and most of it is macOS reading the temperature sensors: it runs every 2 s, and every
-1 s only while a live view is open. `--sample-ms 5000` cuts it further at the price of coarser
-min/max bands (energy totals stay exact at any interval).
+sampler, and most of it is macOS reading the temperature sensors: it runs every 2 s in all
+views. Process scans run every 15 s
+normally and about every 5 s with live viewers. `--sample-ms 5000` cuts system collection cost
+further at the price of coarser min/max bands (energy totals stay exact at any interval).
 
 ## Requirements
 
@@ -164,13 +179,16 @@ than being ignored. `--no-config` ignores the file.
 | `--listen` | `127.0.0.1:9393` | Address of the dashboard and API (env `MAC_MONITOR_LISTEN`) |
 | `--data-dir` | `~/Library/Application Support/mac-monitor` | Database location (env `MAC_MONITOR_DATA_DIR`) |
 | `--sample-ms` | `2000` | Sampling interval, 250–15000 ms |
-| `--live-sample-ms` | `1000` | Sampling interval while a live view is open |
 | `--raw-retention-days` | `14` | How long 15-second data is kept |
 | `--retention-days` | `365` | How long 5-minute data and events are kept |
 | `--alert-cpu-temp` | `100` | Alert when CPU temperature stays above this (°C) for 2 minutes |
 | `--alert-disk-free-gb` | `10` | Alert when free disk space drops below this |
 | `--notify` | off | Show alerts as macOS notifications (`--notify=false` turns it off) |
 | `--ntfy-url` | none | Also POST alerts to an ntfy topic, e.g. `https://ntfy.sh/my-topic` |
+
+`--sample-ms` controls the single system sampling cadence in all views. The old
+`live_sample_ms` config key and `--live-sample-ms` flag are accepted for compatibility but
+ignored. `/api/meta.live_sample_ms` remains a compatibility alias of `sample_ms`.
 
 The electricity price for the cost figures is set in the dashboard (stored in the browser).
 
@@ -188,11 +206,19 @@ Every sample (stored as avg/min/max per 15 s):
 | `swap.used`, `swap.total`, `swap.in`, `swap.out` | Swap use and traffic |
 | `disk.read`, `disk.write`, `net.rx`, `net.tx`, `load.1` | Throughput (all block devices; `en*` interfaces) and load |
 
+System samples remain in RAM for 15 minutes (at the shared 2-second cadence), and are
+lost on restart. Live charts use that buffer; historical charts query stored aggregates. The
+individual system samples are not written to disk. Completed 15-second aggregates can be
+queried before their periodic disk flush.
+
 Every 15 seconds: `disk.free`, `disk.total`, `procs.count`, `self.cpu`, `self.mem`, and per
 process group `proc.cpu`, `proc.mem`, `proc.gpu`, `proc.power`, `proc.disk_read`,
 `proc.disk_write`, `proc.count` (`proc.<metric>:<group>`). A group gets its own series once it
 uses ≥2% CPU, ≥128 MB, ≥0.1 W, ≥1% GPU or ≥4 MB/s disk, and keeps it for 10 minutes after;
-smaller groups are summed into `other`.
+smaller groups are summed into `other`. When Live is enabled, process CPU, GPU, power, memory
+and disk readings from the shorter scan intervals are weighted by elapsed time into the same
+15-second history points; process counts reflect the latest scan. Enabling Live adds no new
+storage tier or retention policy.
 
 ## API
 
@@ -204,7 +230,7 @@ All times are unix seconds.
 | `GET /api/summary?keys=&match=&from=&to=` | Per key: `avg`, `min`, `max`, `integral` (value-seconds; joules for watts), `cov`, `last` |
 | `GET /api/events?from=&to=` | Event log |
 | `GET /api/meta` | Machine info, settings, known series |
-| `GET /api/live` | Server-Sent Events: `init` (the last 15 minutes of samples), then `row` every sample |
+| `GET /api/live` | Server-Sent Events: `init` (last 15 minutes of system samples, latest process groups, and sampling cadences), then `row` every system sample and `groups` after each process scan |
 | `GET /api/health` | Liveness |
 | `GET /metrics` | Latest values in Prometheus text format, e.g. `mac_monitor_power_sys_watts` |
 

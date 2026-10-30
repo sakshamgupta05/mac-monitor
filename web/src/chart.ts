@@ -9,6 +9,8 @@ export interface Line {
   label: string;
   color: string;
   values: Values;
+  /** Draw below zero while retaining positive readouts and exports. */
+  invert?: boolean;
   min?: Values;
   max?: Values;
 }
@@ -22,6 +24,18 @@ export interface Marker {
 
 export interface ChartOptions {
   unit: Unit;
+  compact?: boolean;
+  /** Subtle area fills for continuous time-series (enabled by default). */
+  area?: boolean;
+  /** Display-only smoothing; raw readouts, min/max, tables and CSV remain untouched. */
+  smooth?: () => boolean;
+  /** A capacity ceiling, e.g. physical RAM; evaluated on each update. */
+  yMax?: () => number | null;
+  /** False when a supplied ceiling is an automatic shared scale rather than capacity. */
+  capacity?: boolean;
+  hideTimeAxis?: boolean;
+  /** Opposing directions around a common zero, with magnitude labels. */
+  mirrored?: () => boolean;
   kind?: "line" | "stack" | "bars";
   y?: "zero" | "auto" | "ratio";
   height?: number;
@@ -99,6 +113,7 @@ export class Chart {
     this.root = root;
     root.classList.add("chart");
     this.legendEl = el("div", "legend");
+    this.legendEl.hidden = !!o.compact;
     this.plotEl = el("div", "plot");
     this.emptyEl = el("div", "empty", "No data in this range");
     this.tableEl = el("div", "table-view");
@@ -117,9 +132,11 @@ export class Chart {
     this.ts = ts;
     this.lines = lines;
     const visible = lines.filter((l) => !this.hidden.has(l.label));
+    this.root.dataset.smoothed = String(this.smoothing);
+    if (this.o.mirrored) this.root.dataset.directionLayout = this.o.mirrored() ? "mirrored" : "overlay";
     const sig =
       `${this.o.kind}|${[...this.hidden].join(",")}|` +
-      visible.map((l) => `${l.label}:${l.color}:${l.min ? 1 : 0}`).join(";");
+      visible.map((l) => `${l.label}:${l.color}:${l.min ? 1 : 0}:${l.invert ? 1 : 0}`).join(";");
     const data = this.buildData(visible);
     if (!this.u || sig !== this.signature) {
       this.signature = sig;
@@ -158,6 +175,26 @@ export class Chart {
     this.u?.destroy();
   }
 
+  private get smoothing(): boolean {
+    return this.o.kind !== "bars" && !!this.o.smooth?.();
+  }
+
+  private trend(values: Values): Values {
+    if (!this.smoothing) return values;
+    // A centered three-point average never crosses a missing sample or long time gap.
+    // Keep endpoints as recorded rather than drawing an unfinished moving average.
+    return values.map((v, i) => {
+      if (v == null || i === 0 || i === values.length - 1) return v;
+      const prev = values[i - 1];
+      const next = values[i + 1];
+      if (prev == null || next == null) return v;
+      const before = this.ts[i] - this.ts[i - 1];
+      const after = this.ts[i + 1] - this.ts[i];
+      if (before <= 0 || after <= 0 || Math.max(before, after) > Math.min(before, after) * 1.5) return v;
+      return (prev + v + next) / 3;
+    });
+  }
+
   private buildData(visible: Line[]): uPlot.AlignedData {
     const cols: Values[] = [];
     this.columns = [];
@@ -166,8 +203,9 @@ export class Chart {
       const sums: Values[] = [];
       let acc: Values = this.ts.map(() => null);
       for (const l of visible) {
+        const values = this.trend(l.values);
         acc = acc.map((a, i) => {
-          const v = l.values[i];
+          const v = values[i];
           return v == null && a == null ? null : (a ?? 0) + (v ?? 0);
         });
         sums.push(acc);
@@ -176,7 +214,8 @@ export class Chart {
       visible.forEach((line, i) => this.columns.push({ line, col: visible.length - i }));
     } else {
       for (const line of visible) {
-        cols.push(line.values);
+        const values = this.trend(line.values);
+        cols.push(line.invert ? values.map((v) => v == null ? null : -v) : values);
         this.columns.push({ line, col: cols.length });
         if (line.min && line.max) cols.push(line.min, line.max);
       }
@@ -197,7 +236,7 @@ export class Chart {
     if (kind === "stack") {
       for (let i = visible.length - 1; i >= 0; i--) {
         const l = visible[i];
-        series.push({ label: l.label, stroke: l.color, width: 1.5, fill: mix(l.color, surface, 0.42), points: { show: false } });
+        series.push({ label: l.label, stroke: l.color, width: 1, fill: mix(l.color, surface, 0.42), points: { show: false } });
       }
     } else if (kind === "bars") {
       for (const l of visible) {
@@ -213,7 +252,15 @@ export class Chart {
     } else {
       for (const l of visible) {
         const idx = series.length;
-        series.push({ label: l.label, stroke: l.color, width: 2, points: { show: false } });
+        // When a total has a min/max band, give it the area and keep its detail lines clear.
+        const banded = visible.filter((line) => line.min && line.max);
+        const opacity = this.o.mirrored ? (this.o.mirrored() ? 0.20 : 0.12) : visible.length === 1 ? 0.18 : banded.length === 1 ? (l === banded[0] ? 0.14 : 0) : 0.06;
+        series.push({
+          label: l.label, stroke: l.color, width: 1,
+          fill: this.o.area !== false && opacity > 0 ? alpha(l.color, opacity) : undefined,
+          fillTo: this.o.area !== false ? 0 : undefined,
+          points: { show: false },
+        });
         if (l.min && l.max) {
           series.push({ label: `${l.label} min`, stroke: "transparent", width: 0, points: { show: false } });
           series.push({ label: `${l.label} max`, stroke: "transparent", width: 0, points: { show: false } });
@@ -224,7 +271,9 @@ export class Chart {
 
     const yMode = this.o.y ?? "zero";
     const yRange: uPlot.Range.Function = (_u, min, max) => {
-      if (yMode === "ratio") return [0, Math.max(1, max ?? 1)];
+      const capacity = this.o.yMax?.();
+      if (capacity != null && capacity > 0) return [this.o.mirrored?.() ? -capacity : 0, capacity];
+      if (yMode === "ratio") return [0, this.o.compact ? 1 : Math.max(1, max ?? 1)];
       if (min == null || max == null || !Number.isFinite(min) || !Number.isFinite(max)) return [0, 1];
       if (yMode === "auto") {
         const pad = Math.max((max - min) * 0.15, 1);
@@ -234,31 +283,33 @@ export class Chart {
     };
 
     const opts: uPlot.Options = {
-      width: Math.max(200, this.plotEl.clientWidth),
+      width: Math.max(this.o.compact ? 100 : 200, this.plotEl.clientWidth),
       height: this.height,
       series,
       bands,
       legend: { show: false },
-      padding: [8, 8, 0, 0],
+      padding: [8, 8, this.o.hideTimeAxis ? 8 : 0, 0],
       scales: {
         x: { time: true, range: this.o.xRange ? () => this.o.xRange!() : undefined },
         y: { range: yRange },
       },
       axes: [
-        { stroke: muted, font, grid: { stroke: grid, width: 1 }, ticks: { stroke: grid, width: 1, size: 4 }, space: 70 },
+        { show: !this.o.hideTimeAxis, stroke: muted, font, grid: { stroke: grid, width: 1 }, ticks: { stroke: grid, width: 1, size: 4 }, space: 70 },
         {
+          show: true,
           stroke: muted,
           font,
-          size: 58,
+          size: this.o.compact ? 52 : 58,
+          splits: this.o.compact ? (_u, _axis, min, max) => [min, this.o.mirrored?.() ? 0 : (min + max) / 2, max] : undefined,
           incrs: this.o.unit === "B" || this.o.unit === "B/s" ? BINARY_INCRS : undefined,
           space: 28,
           grid: { stroke: grid, width: 1 },
           ticks: { show: false },
-          values: (_u, splits) => splits.map((v) => axis(this.o.unit, v)),
+          values: (_u, splits) => splits.map((v) => this.o.compact ? axis(this.o.unit, this.o.mirrored?.() ? Math.abs(v) : v).replace(" ", "") : axis(this.o.unit, v)),
         },
       ],
       cursor: {
-        sync: { key: "mm" },
+        sync: { key: this.o.compact ? "mm-live" : "mm" },
         drag: { x: !!this.o.onZoom, y: false, setScale: false },
         points: { show: false },
       },
@@ -274,7 +325,17 @@ export class Chart {
             }
           },
         ],
-        draw: [(u) => this.drawMarkers(u)],
+        draw: [(u) => {
+          this.drawMarkers(u);
+          if (this.o.compact) {
+            const lo = u.scales.y.min ?? 0;
+            const hi = u.scales.y.max ?? 1;
+            this.root.dataset.scaleMin = String(lo);
+            this.root.dataset.scaleMax = String(hi);
+            this.root.setAttribute("role", "img");
+            this.root.setAttribute("aria-label", `${this.lines.map((l) => `${l.label}${l.invert ? " below zero" : this.o.mirrored?.() ? " above zero" : ""}`).join(" and ")}: scale ${fmt(this.o.unit, this.o.mirrored?.() ? 0 : lo)} to ${fmt(this.o.unit, hi)}${(this.o.yMax && this.o.capacity !== false) || this.o.y === "ratio" ? ", capacity" : ", automatically scaled"}`);
+          }
+        }],
       },
     };
     this.u = new uPlot(opts, data, this.plotEl);
@@ -410,7 +471,7 @@ export class Chart {
 
   private resize(): void {
     if (!this.u) return;
-    const width = Math.max(200, this.plotEl.clientWidth);
+    const width = Math.max(this.o.compact ? 100 : 200, this.plotEl.clientWidth);
     if (width !== this.u.width) this.u.setSize({ width, height: this.height });
   }
 }

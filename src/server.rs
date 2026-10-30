@@ -36,7 +36,6 @@ mod assets {
 
 pub struct Settings {
   pub sample_ms: u64,
-  pub live_sample_ms: u64,
   pub raw_retention_days: u32,
   pub retention_days: u32,
   pub data_dir: String,
@@ -195,7 +194,7 @@ async fn meta(State(app): State<App>) -> Json<Value> {
     "now": now_secs(),
     "started": app.shared.started,
     "sample_ms": s.sample_ms,
-    "live_sample_ms": s.live_sample_ms,
+    "live_sample_ms": s.sample_ms,
     "raw_retention_days": s.raw_retention_days,
     "retention_days": s.retention_days,
     "data_dir": s.data_dir,
@@ -230,6 +229,9 @@ struct Init<'a> {
   keys: &'a [String],
   sample_ms: u64,
   rows: Vec<(i64, Vec<Option<f32>>)>,
+  groups: &'a [crate::collector::procs::GroupStat],
+  groups_ts: Option<i64>,
+  process_sample_secs: u64,
 }
 
 async fn live(State(app): State<App>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -237,7 +239,15 @@ async fn live(State(app): State<App>) -> Sse<impl Stream<Item = Result<Event, In
   let init = {
     let live = app.shared.live.lock().unwrap();
     let rows = live.rows.iter().map(|(t, r)| (*t, finite(r))).collect();
-    serde_json::to_string(&Init { keys: &live.keys, sample_ms: app.settings.live_sample_ms, rows }).unwrap()
+    serde_json::to_string(&Init {
+      keys: &live.keys,
+      sample_ms: app.settings.sample_ms,
+      rows,
+      process_sample_secs: crate::collector::LIVE_PROC_SECS,
+      groups: &live.groups,
+      groups_ts: live.groups_ts,
+    })
+    .unwrap()
   };
   let first = Event::default().event("init").data(init);
 
@@ -254,6 +264,10 @@ async fn live(State(app): State<App>) -> Sse<impl Stream<Item = Result<Event, In
           Ok(LiveMsg::Row(t, row)) => {
             let data = serde_json::to_string(&Row { t, v: finite(&row) }).unwrap();
             return Some((Ok(Event::default().event("row").data(data)), (rx, shutdown, None, client)));
+          }
+          Ok(LiveMsg::Groups(ts, groups)) => {
+            let data = serde_json::to_string(&json!({ "ts": ts, "groups": *groups })).unwrap();
+            return Some((Ok(Event::default().event("groups").data(data)), (rx, shutdown, None, client)));
           }
           Ok(LiveMsg::Keys(keys)) => {
             let data = serde_json::to_string(&json!({ "keys": *keys })).unwrap();

@@ -1,6 +1,6 @@
-//! The sampling loop: macmon and host metrics every `sample_ms` (`live_sample_ms` while a live
-//! view is open), folded into 15 s slots (avg/min/max) and 5 min rollups; process groups once
-//! per slot; live rows for the dashboard.
+//! The sampling loop: macmon and host metrics every `sample_ms` in all modes, folded into
+//! 15 s slots (avg/min/max) and 5 min rollups; process groups once
+//! per slot (every 5 s with live viewers); live rows for the dashboard.
 
 pub mod alerts;
 pub mod host;
@@ -18,7 +18,9 @@ use tokio::sync::broadcast;
 use crate::catalog::key;
 use crate::store::{RAW, ROLLUP, Store};
 use alerts::{AlertConfig, Alerts};
-use procs::{GroupStat, Procs};
+use procs::{GroupStat, Procs, Scan};
+
+pub const LIVE_PROC_SECS: u64 = 5;
 
 const FLUSH_SECS: i64 = 60;
 const PRUNE_SECS: i64 = 3600;
@@ -57,15 +59,17 @@ pub struct MachineInfo {
 pub enum LiveMsg {
   Keys(Arc<Vec<String>>),
   Row(i64, Arc<Vec<f32>>),
+  Groups(i64, Arc<Vec<GroupStat>>),
 }
 
-/// Recent 1 s rows for the live view, in a fixed key order that only grows.
+/// Recent system samples for the live view, in a fixed key order that only grows.
 #[derive(Default)]
 pub struct Live {
   pub keys: Vec<String>,
   index: HashMap<String, usize>,
   pub rows: VecDeque<(i64, Arc<Vec<f32>>)>,
   pub groups: Vec<GroupStat>,
+  pub groups_ts: Option<i64>,
   /// Milliseconds of rows to keep.
   keep_ms: i64,
 }
@@ -108,7 +112,7 @@ pub struct Shared {
   pub started: i64,
   pub last_sample: AtomicI64,
   pub shutdown: AtomicBool,
-  /// Open live views; the collector samples faster while there are any.
+  /// Open live views; only process scans accelerate while there are any.
   pub live_clients: AtomicUsize,
 }
 
@@ -146,7 +150,6 @@ impl Drop for LiveClient {
 #[derive(Debug, Clone)]
 pub struct CollectorConfig {
   pub sample_ms: u64,
-  pub live_sample_ms: u64,
   pub alerts: AlertConfig,
 }
 
@@ -172,6 +175,47 @@ impl BandAcc {
 
   fn values(&self) -> [f32; 3] {
     [(self.sum / self.n.max(1) as f64) as f32, self.min, self.max]
+  }
+}
+
+/// Preserve a full slot's usage when live scans split the counter deltas into shorter pieces.
+/// Missing groups contribute zero; counts are from the most recent scan.
+#[derive(Default)]
+struct ProcessWindow {
+  seconds: f64,
+  groups: BTreeMap<String, ([f64; 6], u32)>,
+  self_cpu_seconds: f64,
+}
+
+impl ProcessWindow {
+  fn add(&mut self, scan: &Scan) {
+    let dt = scan.elapsed_secs;
+    self.seconds += dt;
+    self.self_cpu_seconds += scan.self_cpu as f64 * dt;
+    for (_, count) in self.groups.values_mut() {
+      *count = 0;
+    }
+    for g in &scan.groups {
+      let (sums, count) = self.groups.entry(g.name.clone()).or_default();
+      for (sum, value) in sums.iter_mut().zip([g.cpu, g.mem, g.power, g.gpu, g.disk_read, g.disk_write]) {
+        *sum += value as f64 * dt;
+      }
+      *count = g.count;
+    }
+  }
+
+  fn finish(self, mut latest: Scan) -> Scan {
+    let seconds = self.seconds.max(f64::EPSILON);
+    latest.self_cpu = (self.self_cpu_seconds / seconds) as f32;
+    latest.groups = self
+      .groups
+      .into_iter()
+      .map(|(name, (sums, count))| {
+        let [cpu, mem, power, gpu, disk_read, disk_write] = sums.map(|v| (v / seconds) as f32);
+        GroupStat { name, cpu, mem, power, gpu, disk_read, disk_write, count }
+      })
+      .collect();
+    latest
   }
 }
 
@@ -212,6 +256,8 @@ pub struct Collector {
   cfg: CollectorConfig,
   host: host::Host,
   procs: Procs,
+  proc_window: ProcessWindow,
+  last_proc_scan: Instant,
   slot: Option<i64>,
   acc: BTreeMap<String, BandAcc>,
   roll_slot: i64,
@@ -233,6 +279,8 @@ impl Collector {
       cfg,
       host: host::Host::new(),
       procs: Procs::new(),
+      proc_window: ProcessWindow::default(),
+      last_proc_scan: Instant::now(),
       slot: None,
       acc: BTreeMap::new(),
       roll_slot: 0,
@@ -257,13 +305,11 @@ impl Collector {
     self.record_startup();
     // Baseline for process counters, so the first slot has rates.
     self.procs.scan(now_secs());
+    self.last_proc_scan = Instant::now();
 
     let mut values = Vec::with_capacity(96);
     while !self.shared.shutdown.load(Ordering::Relaxed) {
-      let sample_ms = match self.shared.live_clients.load(Ordering::Relaxed) {
-        0 => self.cfg.sample_ms,
-        _ => self.cfg.live_sample_ms.min(self.cfg.sample_ms),
-      };
+      let sample_ms = self.cfg.sample_ms;
       let wall0 = now_f64();
       let mono0 = Instant::now();
       values.clear();
@@ -299,6 +345,10 @@ impl Collector {
         && prev != slot
       {
         self.close_slot(prev);
+      } else if self.shared.live_clients.load(Ordering::Relaxed) > 0
+        && self.last_proc_scan.elapsed() >= Duration::from_secs(LIVE_PROC_SECS)
+      {
+        self.scan_procs();
       }
       self.slot = Some(slot);
       for (k, v) in &values {
@@ -361,6 +411,8 @@ impl Collector {
     // Rates across the sleep would be meaningless.
     self.host = host::Host::new();
     self.procs.scan(to);
+    self.last_proc_scan = Instant::now();
+    self.proc_window = ProcessWindow::default();
   }
 
   fn publish_live(&self, ts_ms: i64, values: &[(String, f32)]) {
@@ -374,14 +426,14 @@ impl Collector {
   /// Writes the finished 15 s slot, samples process groups, updates the 5 min rollup and
   /// evaluates events and alerts.
   fn close_slot(&mut self, slot: i64) {
-    let now = now_secs();
     let mut slow = Vec::new();
     self.host.sample_slow(&mut slow);
     for (k, v) in slow {
       self.acc.entry(k).or_default().add(v, v, v);
     }
 
-    let scan = self.procs.scan(now);
+    let scan = self.scan_procs();
+    let scan = std::mem::take(&mut self.proc_window).finish(scan);
     let total = scan.total as f32;
     self.acc.entry("procs.count".into()).or_default().add(total, total, total);
 
@@ -433,6 +485,17 @@ impl Collector {
     }
     self.roll = roll;
 
+    self.level_events(slot, &summary);
+    for fired in self.alerts.evaluate(slot, &summary) {
+      let _ = self.store.add_event(slot, None, "alert", fired.level, &fired.title, &fired.detail);
+    }
+  }
+
+  fn scan_procs(&mut self) -> Scan {
+    let now = now_secs();
+    let scan = self.procs.scan(now);
+    self.last_proc_scan = Instant::now();
+    self.proc_window.add(&scan);
     for exit in &scan.exits {
       let title = format!("{} exited", exit.name);
       let detail = format!(
@@ -446,11 +509,14 @@ impl Collector {
       let _ = self.store.add_event(now, None, "process", "info", &title, &detail);
     }
 
-    self.level_events(slot, &summary);
-    for fired in self.alerts.evaluate(slot, &summary) {
-      let _ = self.store.add_event(slot, None, "alert", fired.level, &fired.title, &fired.detail);
+    let mut live = self.shared.live.lock().unwrap();
+    // Keep only the latest snapshot, not per-process rows in the system sample ring.
+    live.groups.clone_from(&scan.groups);
+    live.groups_ts = Some(now);
+    if self.shared.tx.receiver_count() > 0 {
+      let _ = self.shared.tx.send(LiveMsg::Groups(now, Arc::new(live.groups.clone())));
     }
-    self.shared.live.lock().unwrap().groups = scan.groups;
+    scan
   }
 
   fn level_events(&mut self, slot: i64, summary: &HashMap<String, (f32, f32)>) {
@@ -562,6 +628,65 @@ pub fn human_bytes(b: f64) -> String {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn live_clients_track_process_acceleration_until_last_disconnect() {
+    let shared = Shared::new(900);
+    assert_eq!(shared.live_clients.load(Ordering::Relaxed), 0);
+    let first = LiveClient::new(shared.clone());
+    let second = LiveClient::new(shared.clone());
+    assert_eq!(shared.live_clients.load(Ordering::Relaxed), 2);
+    drop(first);
+    assert_eq!(shared.live_clients.load(Ordering::Relaxed), 1);
+    drop(second);
+    assert_eq!(shared.live_clients.load(Ordering::Relaxed), 0);
+  }
+
+  #[test]
+  fn process_history_weights_live_scans_and_retains_exited_usage() {
+    let mut window = ProcessWindow::default();
+    let scan = |seconds, cpu, name: &str| Scan {
+      elapsed_secs: seconds,
+      self_cpu: cpu,
+      self_mem: 123.0,
+      groups: vec![GroupStat {
+        name: name.into(), cpu, mem: 100.0, power: cpu * 2.0,
+        gpu: cpu / 10.0, disk_read: cpu * 100.0, disk_write: cpu * 50.0,
+        count: 2, ..Default::default()
+      }],
+      ..Default::default()
+    };
+    window.add(&scan(3.0, 1.0, "exited"));
+    window.add(&scan(7.0, 2.0, "running"));
+    let latest = scan(5.0, 0.5, "running");
+    window.add(&latest);
+    let history = window.finish(latest);
+    let exited = &history.groups[0];
+    let running = &history.groups[1];
+    assert_eq!(exited.count, 0);
+    assert_eq!(running.count, 2);
+    assert!((exited.cpu * 15.0 - 3.0).abs() < 0.0001);
+    assert!((running.cpu * 15.0 - 16.5).abs() < 0.0001);
+    assert!((running.power * 15.0 - 33.0).abs() < 0.0001);
+    assert!((running.disk_read * 15.0 - 1650.0).abs() < 0.001);
+    assert!((running.disk_write * 15.0 - 825.0).abs() < 0.001);
+    assert!((running.gpu * 15.0 - 1.65).abs() < 0.0001);
+    assert!((running.mem - 80.0).abs() < 0.001);
+    assert!((history.self_cpu * 15.0 - 19.5).abs() < 0.0001);
+    assert_eq!(history.self_mem, 123.0);
+  }
+
+  #[test]
+  fn process_history_without_live_preserves_the_single_scan() {
+    let scan = Scan {
+      elapsed_secs: 15.2, self_cpu: 0.2,
+      groups: vec![GroupStat { name: "app".into(), cpu: 0.75, count: 1, ..Default::default() }],
+      ..Default::default()
+    };
+    let mut window = ProcessWindow::default();
+    window.add(&scan);
+    assert_eq!(window.finish(scan).groups[0].cpu, 0.75);
+  }
 
   #[test]
   fn debounce_needs_two_slots() {

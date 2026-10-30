@@ -97,7 +97,7 @@ unsafe extern "C" {
   fn mach_timebase_info(info: *mut MachTimebaseInfo) -> c_int;
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct GroupStat {
   pub name: String,
   /// Cores used, 1.0 = one fully busy core.
@@ -144,6 +144,7 @@ pub struct Exit {
 
 #[derive(Debug, Default)]
 pub struct Scan {
+  pub elapsed_secs: f64,
   pub groups: Vec<GroupStat>,
   pub exits: Vec<Exit>,
   /// Processes of all users.
@@ -204,7 +205,7 @@ impl Procs {
 
     list_pids(&mut self.pids);
     let gpu = gpu_times();
-    let mut scan = Scan { total: self.pids.len(), ..Default::default() };
+    let mut scan = Scan { total: self.pids.len(), elapsed_secs: elapsed_ns as f64 / 1e9, ..Default::default() };
     let mut groups: HashMap<String, GroupStat> = HashMap::new();
     let mut seen = HashSet::with_capacity(self.pids.len());
     let secs = elapsed_ns as f64 / 1e9;

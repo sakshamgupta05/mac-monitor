@@ -1,7 +1,7 @@
 import "uplot/dist/uPlot.min.css";
 import "./styles.css";
 
-import { type LiveInit, type Meta, type MonitorEvent, type RangeData, type Summary, type Values, api } from "./api";
+import { type LiveGroup, type LiveGroups, type LiveInit, type Meta, type MonitorEvent, type RangeData, type Summary, type Values, api } from "./api";
 import { Chart, type Line, type Marker, Strip, css, sparkline } from "./chart";
 import * as F from "./format";
 import type { Unit } from "./format";
@@ -17,7 +17,7 @@ interface Preset {
 }
 
 const PRESETS: Preset[] = [
-  { id: "live", label: "Live", secs: 900, title: "Last 15 minutes, updated every second" },
+  { id: "15m", label: "15m", secs: 900, title: "Last 15 minutes of recorded history" },
   { id: "1h", label: "1h", secs: 3600, title: "Last hour" },
   { id: "6h", label: "6h", secs: 6 * 3600, title: "Last 6 hours" },
   { id: "24h", label: "24h", secs: 86400, title: "Last 24 hours" },
@@ -52,7 +52,15 @@ const state = readHash();
 const view = { from: 0, to: 0 };
 
 const now = () => Math.floor(Date.now() / 1000);
-const isLive = () => state.preset === "live";
+// Deliberately session-only and opt-in: visiting a URL never accelerates collection.
+let liveEnabled = false;
+let smoothHistory = localStorage.getItem("mm.smoothHistory") === "true";
+let liveWindow = 120;
+let liveDirectionLayout = "mirrored";
+let liveSampleMs = 2000;
+let liveProcessSecs = 5;
+const liveCharts = new Map<string, Chart>();
+const liveRateScales = new Map<string, number>();
 
 function currentWindow(): [number, number] {
   if (state.preset === "custom") return [state.from, state.to];
@@ -321,6 +329,7 @@ let price = Number(localStorage.getItem("mm.price") ?? "0.15") || 0.15;
 let energyBars: { ts: number[]; wh: number[]; step: number } = { ts: [], wh: [], step: 3600 };
 let timer: number | undefined;
 let refreshing = false;
+let refreshAgain = false;
 let lastError = "";
 
 const markers = (): Marker[] =>
@@ -383,19 +392,35 @@ function tile(id: string, label: string): HTMLElement {
 
 function buildLayout(): void {
   const panels = hostPanels(meta);
-  const main = $("app");
-  main.replaceChildren();
+  const root = $("app");
+  root.replaceChildren();
+  buildLiveLayout(root);
+  const main = h("section", { id: "historical", "aria-label": "Historical" });
+  main.append(h("header", { class: "workspace-head" }, h("div", {}, h("h2", {}, "Historical"), h("p", { class: "help", id: "history-description" }, "Recorded metrics for the selected range")), document.querySelector<HTMLElement>('.controls[aria-label="Time range"]')!));
+  root.append(main);
+  const smoothing = h("input", { type: "checkbox", id: "history-smoothing", "aria-label": "Smooth historical trends", "aria-describedby": "history-smoothing-note" });
+  smoothing.checked = smoothHistory;
+  const smoothingLabel = h("label", { class: "smoothing-control", title: "Smooth drawn trends across three points. Values, min/max bands, tables and CSV keep the recorded data." }, smoothing, "Smooth trends");
+  const smoothingNote = h("span", { class: "help", id: "history-smoothing-note" }, "Trends smoothed; values and peaks are original.");
+  smoothingNote.hidden = !smoothHistory;
+  main.querySelector(".controls")!.append(smoothingLabel, smoothingNote);
+  smoothing.addEventListener("change", () => {
+    smoothHistory = smoothing.checked;
+    smoothingNote.hidden = !smoothHistory;
+    localStorage.setItem("mm.smoothHistory", String(smoothHistory));
+    for (const chart of charts.values()) chart.rebuild();
+  });
 
   const tiles = h("section", { class: "tiles", "aria-label": "Summary" });
   for (const [id, label] of [
-    ["power", "System power"],
+    ["power", "System power · avg"],
     ["energy", "Energy"],
-    ["cpu", "CPU"],
-    ["gpu", "GPU"],
-    ["mem", "Memory used"],
-    ["swap", "Swap used"],
-    ["temp", "CPU temperature"],
-    ["disk", "Disk free"],
+    ["cpu", "CPU · avg"],
+    ["gpu", "GPU · avg"],
+    ["mem", "Memory used · last point"],
+    ["swap", "Swap used · last point"],
+    ["temp", "CPU temperature · last point"],
+    ["disk", "Disk free · last point"],
   ]) {
     tiles.append(tile(id, label));
   }
@@ -435,7 +460,7 @@ function buildLayout(): void {
   }
 
   for (const [id, p] of panelDefs) {
-    charts.set(id, new Chart($(`body-${id}`), { unit: p.unit, kind: p.kind, y: p.y, xRange, onZoom, markers, totalLabel: "Physical memory" }));
+    charts.set(id, new Chart($(`body-${id}`), { unit: p.unit, smooth: () => smoothHistory, kind: p.kind, y: p.y, xRange, onZoom, markers, totalLabel: "Physical memory" }));
   }
 
   const priceInput = h("input", {
@@ -517,7 +542,6 @@ function renderControls(): void {
   presets.replaceChildren();
   for (const p of PRESETS) {
     const b = h("button", { type: "button", title: p.title, "aria-pressed": String(state.preset === p.id) }, p.label);
-    if (p.id === "live") b.prepend(h("span", { class: "live-dot", "aria-hidden": "true" }));
     b.addEventListener("click", () => {
       state.preset = p.id;
       writeHash();
@@ -585,6 +609,7 @@ function setupControls(): void {
 
 function rerenderAll(): void {
   for (const c of charts.values()) c.rebuild();
+  for (const c of liveCharts.values()) c.rebuild();
   pressureStrip.draw();
   thermalStrip.draw();
   renderTiles();
@@ -643,11 +668,11 @@ function renderHost(data: RangeData): void {
 async function loadHost(from: number, to: number): Promise<void> {
   const { keys, minmax } = hostKeys();
   const data = await api.range({ keys, from, to, points: plotPoints(), minmax });
-  if (!isLive()) renderHost(data);
+  renderHost(data);
 }
 
 // ---------------------------------------------------------------------------------------------
-// Live mode: 1-second rows over Server-Sent Events.
+// Live mode: system samples over Server-Sent Events at the shared collection cadence.
 
 let source: EventSource | null = null;
 let liveKeys: string[] = [];
@@ -661,7 +686,16 @@ function startLive(): void {
     const init = JSON.parse((e as MessageEvent).data) as LiveInit;
     liveKeys = init.keys;
     liveRows = init.rows;
+    liveGroups = { groups: init.groups, groups_ts: init.groups_ts };
+    liveSampleMs = init.sample_ms;
+    liveProcessSecs = init.process_sample_secs;
+    renderLiveProcTable();
     scheduleLive();
+  });
+  source.addEventListener("groups", (e) => {
+    const snapshot = JSON.parse((e as MessageEvent).data) as { ts: number; groups: LiveGroup[] };
+    liveGroups = { groups: snapshot.groups, groups_ts: snapshot.ts };
+    renderLiveProcTable();
   });
   source.addEventListener("keys", (e) => {
     liveKeys = JSON.parse((e as MessageEvent).data).keys;
@@ -673,13 +707,24 @@ function startLive(): void {
     while (liveRows.length && liveRows[0][0] < cutoff) liveRows.shift();
     scheduleLive();
   });
-  source.addEventListener("error", () => setStatus("Reconnecting…", "error"));
-  source.addEventListener("open", () => setStatus("Live", "live"));
+  source.addEventListener("error", () => {
+    liveConnected = false;
+    renderLiveStatus();
+    renderLiveProcTable();
+  });
+  source.addEventListener("open", () => {
+    liveConnected = true;
+    renderLiveStatus();
+    renderLiveProcTable();
+  });
 }
 
 function stopLive(): void {
   source?.close();
   source = null;
+  liveConnected = false;
+  if (liveFrame) cancelAnimationFrame(liveFrame);
+  liveFrame = 0;
 }
 
 function scheduleLive(): void {
@@ -691,17 +736,141 @@ function scheduleLive(): void {
 }
 
 function renderLive(): void {
-  if (!isLive() || !liveRows.length) return;
-  const t = now();
-  view.from = t - 900;
-  view.to = t;
-  const ts = liveRows.map((r) => r[0] / 1000);
-  const series: RangeData["series"] = {};
-  liveKeys.forEach((k, i) => {
-    series[k] = { avg: liveRows.map((r) => r[1][i] ?? null) };
+  if (!liveRows.length) return;
+  const end = liveRows[liveRows.length - 1][0] / 1000;
+  const rows = liveRows.filter(([t]) => t / 1000 >= end - liveWindow);
+  const ts = rows.map(([t]) => t / 1000);
+  for (const def of LIVE_PANELS) {
+    const value = (key: string) => liveValue(key);
+    const v = value(def.keys[0]);
+    let text = F.fmt(def.unit, v);
+    let sub = "";
+    if (def.id === "mem") {
+      const total = value("mem.total");
+      sub = `${total != null ? `of ${F.bytes(total)} · ` : ""}${value("mem.pressure") == null ? "" : ["Normal", "Warning", "Critical"][Math.min(2, Math.round(value("mem.pressure")!))] + " pressure"}`;
+    } else if (def.keys.length === 2) {
+      const a = value(def.keys[0]);
+      const b = value(def.keys[1]);
+      $(`live-rate-${def.id}-0`).textContent = F.fmt(def.unit, a);
+      $(`live-rate-${def.id}-1`).textContent = F.fmt(def.unit, b);
+      sub = liveDirectionLayout === "mirrored" ? "6s average · mirrored" : "6s average · overlay";
+    } else if (def.id === "power") sub = `CPU ${F.fmt("C", value("temp.cpu"))} · GPU ${F.fmt("C", value("temp.gpu"))}`;
+    else sub = def.id === "cpu" ? "Across all cores" : "Share of GPU time";
+    if (def.keys.length === 1) $(`live-value-${def.id}`).textContent = text;
+    $(`live-sub-${def.id}`).textContent = sub;
+    const lines = def.keys.map((key, i) => ({ label: def.labels[i], color: slot(i), values: rows.map((r) => r[1][liveKeys.indexOf(key)] ?? null) }));
+    if (def.keys.length === 2) {
+      const smoothed = lines.map((line) => ({ ...line, label: `${line.label} · 6s average`, values: movingAverage(ts, line.values, 6) }));
+      const peak = smoothed.reduce((max, line) => line.values.reduce<number>((m, v) => Math.max(m, v ?? 0), max), 0);
+      // Both directions use the same zero baseline and ceiling, even when one is idle.
+      liveRateScales.set(def.id, peak > 0 ? 2 ** Math.ceil(Math.log2(peak * 1.05)) : 1024);
+      smoothed.forEach((_line, i) => {
+        $(`live-direction-${def.id}-${i}`).textContent = `${def.labels[i]}${liveDirectionLayout === "mirrored" ? (i === 0 ? " ↑" : " ↓") : ""}`;
+      });
+      liveCharts.get(def.id)!.setData(ts, smoothed.map((line, i) => ({ ...line, invert: liveDirectionLayout === "mirrored" && i === 1 })));
+    } else liveCharts.get(def.id)!.setData(ts, lines);
+  }
+  renderLiveStatus();
+}
+
+/** Presentation only: preserve gaps and keep current readings and stored metrics unchanged. */
+function movingAverage(ts: number[], values: Values, seconds: number): Values {
+  let start = 0;
+  let sum = 0;
+  let count = 0;
+  return values.map((value, i) => {
+    if (value != null) { sum += value; count++; }
+    while (ts[i] - ts[start] >= seconds) {
+      const old = values[start++];
+      if (old != null) { sum -= old; count--; }
+    }
+    return value == null || count === 0 ? null : sum / count;
   });
-  renderHost({ from: view.from, to: view.to, interval: 1, step: meta.live_sample_ms / 1000, ts, series });
-  setStatus("Live", "live");
+}
+
+function liveValue(key: string): number | null {
+  const i = liveKeys.indexOf(key);
+  if (i < 0) return null;
+  for (let r = liveRows.length - 1; r >= 0; r--) {
+    if (liveRows[r][1][i] != null) return liveRows[r][1][i];
+  }
+  return null;
+}
+
+const LIVE_PANELS: { id: string; title: string; keys: string[]; labels: string[]; unit: Unit }[] = [
+  { id: "cpu", title: "CPU", keys: ["cpu.active"], labels: ["All cores"], unit: "ratio" },
+  { id: "mem", title: "Memory", keys: ["mem.used"], labels: ["Used"], unit: "B" },
+  { id: "gpu", title: "GPU", keys: ["gpu.active"], labels: ["Active"], unit: "ratio" },
+  { id: "disk", title: "Disk", keys: ["disk.read", "disk.write"], labels: ["Read", "Write"], unit: "B/s" },
+  { id: "net", title: "Network", keys: ["net.rx", "net.tx"], labels: ["Received", "Sent"], unit: "B/s" },
+  { id: "power", title: "System power", keys: ["power.sys"], labels: ["System"], unit: "W" },
+];
+
+function buildLiveLayout(root: HTMLElement): void {
+  const toggle = h("input", { id: "live-toggle", type: "checkbox" });
+  const windowPicker = h("select", { id: "live-window", "aria-label": "Live chart window" });
+  for (const seconds of [60, 120, 300, 900]) {
+    const option = h("option", { value: String(seconds) }, `${seconds / 60} min`);
+    option.selected = seconds === liveWindow;
+    windowPicker.append(option);
+  }
+  const layoutPicker = h("select", { id: "live-direction-layout", "aria-label": "Disk and network chart layout" },
+    h("option", { value: "mirrored" }, "Mirrored"), h("option", { value: "overlay" }, "Overlay"));
+  layoutPicker.addEventListener("change", () => { liveDirectionLayout = layoutPicker.value; renderLive(); });
+  const controls = h("div", { class: "live-controls" }, h("label", {}, "I/O view ", layoutPicker), h("label", {}, "Chart window ", windowPicker), h("label", { class: "live-switch" }, toggle, "Live updates"));
+  const grid = h("div", { class: "live-grid" });
+  const section = h("section", { id: "live-section", "aria-label": "Live" }, h("header", { class: "workspace-head" }, h("div", {}, h("h2", {}, "Live"), h("p", { id: "live-status", class: "help", role: "status" }, "Paused · enable Live updates to see current activity")), controls), grid);
+  root.append(section);
+  for (const p of LIVE_PANELS) {
+    const plot = h("div", { id: `live-chart-${p.id}` });
+    const paired = p.keys.length === 2;
+    grid.append(h("article", { class: `live-metric${paired ? " directional" : ""}`, id: `live-metric-${p.id}` }, h("h3", {}, p.title), paired ? null : h("div", { class: "live-value", id: `live-value-${p.id}` }, "–"), h("p", { class: "help", id: `live-sub-${p.id}` }, "Waiting for live samples"), plot));
+    const xRange = (): [number, number] => {
+      const end = (liveRows[liveRows.length - 1]?.[0] ?? Date.now()) / 1000;
+      return [end - liveWindow, end];
+    };
+    if (paired) {
+      const directions = h("div", { class: "direction-readouts" });
+      p.keys.forEach((_key, i) => {
+        const swatch = h("span", { class: "key-line", "aria-hidden": "true" });
+        swatch.style.background = slot(i);
+        directions.append(h("div", { class: "direction-head" }, h("span", {}, swatch, h("span", { id: `live-direction-${p.id}-${i}` }, `${p.labels[i]} ${i === 0 ? "↑" : "↓"}`)), h("strong", { id: `live-rate-${p.id}-${i}`, class: "num" }, "–")));
+      });
+      plot.before(directions);
+      liveCharts.set(p.id, new Chart(plot, { unit: p.unit, compact: true, area: true, height: 110, hideTimeAxis: true, capacity: false, mirrored: () => liveDirectionLayout === "mirrored", yMax: () => liveRateScales.get(p.id) ?? 1024, xRange }));
+    } else {
+      liveCharts.set(p.id, new Chart(plot, { unit: p.unit, compact: true, area: true, height: 110,
+        yMax: p.id === "mem" ? () => liveValue("mem.total") ?? (meta.machine.memory_gb ? meta.machine.memory_gb * 1024 ** 3 : null) : undefined,
+        y: p.unit === "ratio" ? "ratio" : "zero", xRange,
+      }));
+    }
+  }
+  const filter = h("input", { type: "search", placeholder: "Filter groups", "aria-label": "Filter live process groups" });
+  filter.addEventListener("input", () => { liveProcFilter = filter.value.toLowerCase(); renderLiveProcTable(); });
+  const table = card("live-procs", "Current processes", "Grouped by app, current user only. CPU: 100% = one core. Small groups are combined into Other.", { table: false });
+  table.querySelector(".card-actions")!.append(filter);
+  section.append(table);
+  toggle.addEventListener("change", () => {
+    liveEnabled = toggle.checked;
+    syncLiveConnection();
+  });
+  windowPicker.addEventListener("change", () => { liveWindow = Number(windowPicker.value); renderLive(); });
+  renderLiveProcTable();
+}
+
+function renderLiveStatus(): void {
+  const ts = liveRows[liveRows.length - 1]?.[0];
+  const label = !liveEnabled ? "Paused" : document.hidden ? "Paused while tab is hidden" : !liveConnected ? "Connecting / reconnecting…" : "Live";
+  $("live-status").textContent = `${label}${ts ? ` · last system sample ${F.time(ts / 1000)}` : (liveEnabled ? " · waiting for first sample" : " · enable Live updates to see current activity")}${liveEnabled ? ` · system ${liveSampleMs / 1000}s · processes ~${liveProcessSecs}s` : " · background recording continues"}`;
+  $("live-section").classList.toggle("paused", !liveEnabled || !liveConnected);
+}
+
+function syncLiveConnection(): void {
+  if (liveEnabled && !document.hidden) {
+    if (!source) startLive();
+  } else stopLive();
+  renderLiveStatus();
+  renderLiveProcTable();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -723,13 +892,6 @@ const SUMMARY_KEYS = [
 ];
 
 function latest(key: string): number | null {
-  if (isLive() && liveRows.length) {
-    const i = liveKeys.indexOf(key);
-    for (let r = liveRows.length - 1; r >= 0 && i >= 0; r--) {
-      const v = liveRows[r][1][i];
-      if (v != null) return v;
-    }
-  }
   return hostSummary[key]?.last ?? null;
 }
 
@@ -762,7 +924,7 @@ function statusChip(level: number | null): HTMLElement {
 function renderTiles(): void {
   if (!meta) return;
   const spark = slot(0);
-  setTile("power", F.fmt("W", latest("power.sys")), [avgPeak("power.sys", "W")], { key: "power.sys", color: spark });
+  setTile("power", F.fmt("W", hostSummary["power.sys"]?.avg ?? null), [avgPeak("power.sys", "W")], { key: "power.sys", color: spark });
 
   const sys = hostSummary["power.sys"];
   const wh = sys ? sys.integral / 3600 : 0;
@@ -770,8 +932,8 @@ function renderTiles(): void {
   setTile("energy", sys ? F.energy(wh) : "–", [sys ? `${F.money((wh / 1000) * price)} at $${price}/kWh` : ""]);
   $("tile-energy").title = covered ? `${F.duration(covered)} of the range has power data` : "";
 
-  setTile("cpu", F.fmt("ratio", latest("cpu.active")), [avgPeak("cpu.active", "ratio")], { key: "cpu.active", color: spark });
-  setTile("gpu", F.fmt("ratio", latest("gpu.active")), [avgPeak("gpu.active", "ratio")], { key: "gpu.active", color: spark });
+  setTile("cpu", F.fmt("ratio", hostSummary["cpu.active"]?.avg ?? null), [avgPeak("cpu.active", "ratio")], { key: "cpu.active", color: spark });
+  setTile("gpu", F.fmt("ratio", hostSummary["gpu.active"]?.avg ?? null), [avgPeak("gpu.active", "ratio")], { key: "gpu.active", color: spark });
 
   const total = latest("mem.total");
   const pressure = latest("mem.pressure");
@@ -859,9 +1021,24 @@ const PROC_COLUMNS: { id: keyof GroupRow; label: string; title: string; fmt: (r:
   { id: "count", label: "Procs", title: "Processes in the group (latest)", fmt: (r) => String(r.count) },
 ];
 
+const LIVE_PROC_COLUMNS: { id: keyof LiveGroup; label: string; title: string; fmt: (r: LiveGroup) => string }[] = [
+  { id: "name", label: "Group", title: "App bundle or process name", fmt: (r) => r.name },
+  { id: "cpu", label: "CPU now", title: "CPU over the latest scan interval, 100% = one core", fmt: (r) => F.pct(r.cpu) },
+  { id: "mem", label: "Memory now", title: "Memory footprint at the latest scan", fmt: (r) => F.bytes(r.mem) },
+  { id: "gpu", label: "GPU now", title: "Share of GPU time over the latest scan interval", fmt: (r) => F.pct(r.gpu) },
+  { id: "power", label: "CPU power now", title: "Attributed CPU power over the latest scan interval", fmt: (r) => F.fmt("W", r.power) },
+  { id: "disk_read", label: "Disk read/s", title: "Read rate over the latest scan interval", fmt: (r) => F.fmt("B/s", r.disk_read) },
+  { id: "disk_write", label: "Disk write/s", title: "Write rate over the latest scan interval", fmt: (r) => F.fmt("B/s", r.disk_write) },
+  { id: "count", label: "Procs", title: "Processes at the latest scan", fmt: (r) => String(r.count) },
+];
+
+let liveGroups: LiveGroups | null = null;
+let liveConnected = false;
+let liveProcSort: { col: keyof LiveGroup; desc: boolean } = { col: "cpu", desc: true };
 let procRows: GroupRow[] = [];
 let procSort: { col: keyof GroupRow; desc: boolean } = { col: "cpuSecs", desc: true };
 let procFilter = "";
+let liveProcFilter = "";
 let selfSummary: Record<string, Summary> = {};
 
 const PROC_STACKS: { id: string; fam: string; title: string; help: string; unit: Unit; rank: keyof GroupRow }[] = [
@@ -887,7 +1064,7 @@ function buildProcesses(grid: HTMLElement): void {
   c.querySelector(".card-actions")!.append(filter);
   grid.append(c);
   for (const p of PROC_STACKS) {
-    charts.set(p.id, new Chart($(`body-${p.id}`), { unit: p.unit, kind: "stack", xRange, onZoom, markers, totalLabel: "All groups" }));
+    charts.set(p.id, new Chart($(`body-${p.id}`), { unit: p.unit, smooth: () => smoothHistory, kind: "stack", xRange, onZoom, markers, totalLabel: "All groups" }));
   }
 }
 
@@ -983,28 +1160,46 @@ async function loadProcs(from: number, to: number): Promise<void> {
 }
 
 function renderProcTable(): void {
-  const body = $("body-proc-table");
-  const rows = procRows
-    .filter((r) => !procFilter || r.name.toLowerCase().includes(procFilter))
+  $("body-proc-table").replaceChildren(processTable(procRows, PROC_COLUMNS, procSort));
+}
+
+function renderLiveProcTable(): void {
+  const ts = liveGroups?.groups_ts;
+  const label = !liveEnabled || document.hidden ? "Paused" : !liveConnected ? "Disconnected" : "Latest scan";
+  const note = h("p", { class: "help", id: "proc-live-status" }, `${label}${ts != null ? ` · ${F.time(ts)}` : " · waiting for process data"}. Rates cover the latest scan interval; snapshots refresh about every ${liveProcessSecs}s while enabled.`);
+  $("body-live-procs").replaceChildren(note, processTable(liveGroups?.groups ?? [], LIVE_PROC_COLUMNS, liveProcSort, true));
+}
+
+function processTable<R extends { name: string }>(
+  data: R[],
+  columns: { id: keyof R; label: string; title: string; fmt: (r: R) => string }[],
+  sort: { col: keyof R; desc: boolean },
+  live = false,
+): HTMLElement {
+  const filter = live ? liveProcFilter : procFilter;
+  const rows = data
+    .filter((r) => !filter || r.name.toLowerCase().includes(filter))
     .sort((a, b) => {
-      const x = a[procSort.col];
-      const y = b[procSort.col];
+      const x = a[sort.col];
+      const y = b[sort.col];
       const c = typeof x === "string" ? x.localeCompare(y as string) : (x as number) - (y as number);
-      return procSort.desc ? -c : c;
+      return sort.desc ? -c : c;
     });
   const table = h("table", { class: "proc-table" });
   const head = h("tr");
-  for (const col of PROC_COLUMNS) {
-    const active = procSort.col === col.id;
+  for (const col of columns) {
+    const active = sort.col === col.id;
     const th = h("th", {
       title: col.title,
       class: col.id === "name" ? "" : "num",
-      "aria-sort": active ? (procSort.desc ? "descending" : "ascending") : "none",
+      "aria-sort": active ? (sort.desc ? "descending" : "ascending") : "none",
     });
-    const btn = h("button", { type: "button" }, col.label, active ? (procSort.desc ? " ↓" : " ↑") : "");
+    const btn = h("button", { type: "button" }, col.label, active ? (sort.desc ? " ↓" : " ↑") : "");
     btn.addEventListener("click", () => {
-      procSort = { col: col.id, desc: procSort.col === col.id ? !procSort.desc : col.id !== "name" };
-      renderProcTable();
+      sort.desc = sort.col === col.id ? !sort.desc : col.id !== "name";
+      sort.col = col.id;
+      if (live) renderLiveProcTable();
+      else renderProcTable();
     });
     th.append(btn);
     head.append(th);
@@ -1013,14 +1208,13 @@ function renderProcTable(): void {
   const tbody = h("tbody");
   for (const r of rows) {
     const tr = h("tr", r.name === "other" ? { class: "other-row" } : {});
-    for (const col of PROC_COLUMNS) {
+    for (const col of columns) {
       tr.append(h("td", { class: col.id === "name" ? "name" : "num" }, col.id === "name" && r.name === "other" ? "Other (small groups)" : col.fmt(r)));
     }
     tbody.append(tr);
   }
   table.append(tbody);
-  const wrap = h("div", { class: "table-scroll" }, table);
-  body.replaceChildren(rows.length ? wrap : h("p", { class: "muted pad" }, "No process data in this range."));
+  return rows.length ? h("div", { class: "table-scroll" }, table) : h("p", { class: "muted pad" }, filter ? "No groups match this filter." : live ? (liveEnabled ? "Waiting for process data…" : "Enable Live updates to load current processes.") : "No process data in this range.");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1097,8 +1291,8 @@ function buildOverhead(grid: HTMLElement): void {
   grid.append(card("self.cpu", "mac-monitor CPU", "CPU used by this monitor (100% = one core)."));
   grid.append(card("self.mem", "mac-monitor memory", "Memory footprint of this monitor."));
   grid.append(card("monitors", "Monitoring tools on this Mac", "CPU and memory of monitoring tools seen in the selected range.", { wide: true, table: false }));
-  charts.set("self.cpu", new Chart($("body-self.cpu"), { unit: "cores", xRange, onZoom, height: 140 }));
-  charts.set("self.mem", new Chart($("body-self.mem"), { unit: "B", xRange, onZoom, height: 140 }));
+  charts.set("self.cpu", new Chart($("body-self.cpu"), { unit: "cores", smooth: () => smoothHistory, xRange, onZoom, height: 140 }));
+  charts.set("self.mem", new Chart($("body-self.mem"), { unit: "B", smooth: () => smoothHistory, xRange, onZoom, height: 140 }));
 }
 
 function renderOverhead(): void {
@@ -1147,19 +1341,19 @@ function refreshInterval(): number | null {
 }
 
 async function refresh(): Promise<void> {
-  if (refreshing || document.hidden) return;
+  if (document.hidden) return;
+  if (refreshing) { refreshAgain = true; return; }
   refreshing = true;
   const [from, to] = currentWindow();
-  if (!isLive()) {
-    view.from = from;
-    view.to = to;
-    setStatus("Updating…", "loading");
-  }
+  view.from = from;
+  view.to = to;
+  $("history-description").textContent = `${F.time(from, to - from)} → ${F.time(to, to - from)} · recorded metrics`;
+  setStatus("Updating…", "loading");
   document.body.classList.add("loading");
   try {
     const metaP = api.meta().then((m) => (meta = m));
     await Promise.all([
-      isLive() ? Promise.resolve() : loadHost(from, to),
+      loadHost(from, to),
       loadSummary(from, to),
       loadEnergy(from, to),
       loadProcs(from, to),
@@ -1168,13 +1362,17 @@ async function refresh(): Promise<void> {
     ]);
     renderHeader();
     lastError = "";
-    if (!isLive()) setStatus(`Updated ${F.time(now())}`, "ok");
+    setStatus(`Updated ${F.time(now())}`, "ok");
   } catch (e) {
     lastError = e instanceof Error ? e.message : String(e);
     setStatus(`Error: ${lastError}`, "error");
   } finally {
     refreshing = false;
     document.body.classList.remove("loading");
+    if (refreshAgain) {
+      refreshAgain = false;
+      void refresh().then(schedule);
+    }
   }
 }
 
@@ -1190,14 +1388,6 @@ function schedule(): void {
 
 function restart(): void {
   clearTimeout(timer);
-  if (isLive()) {
-    const t = now();
-    view.from = t - 900;
-    view.to = t;
-    startLive();
-  } else {
-    stopLive();
-  }
   void refresh().then(schedule);
 }
 
@@ -1222,12 +1412,16 @@ async function main(): Promise<void> {
   renderHeader();
   buildLayout();
   restart();
+  renderLiveStatus();
+  window.addEventListener("pagehide", stopLive);
+  window.addEventListener("pageshow", syncLiveConnection);
 
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
       clearTimeout(timer);
-      stopLive();
+      syncLiveConnection();
     } else {
+      syncLiveConnection();
       restart();
     }
   });

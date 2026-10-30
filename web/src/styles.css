@@ -872,3 +872,58 @@ dialog input {
     grid-template-columns: 1fr;
   }
 }
+
+/* Independent current-state workspace and historical analysis. */
+.workspace-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin: 4px 0 16px;
+}
+.workspace-head h2 { margin: 0; font-size: 20px; }
+.live-controls, .live-controls label { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.live-controls { gap: 18px; }
+.live-controls select {
+  background: var(--chart-surface);
+  color: var(--ink);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 8px;
+  font: inherit;
+}
+.live-switch input { accent-color: var(--accent); width: 16px; height: 16px; }
+.live-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; margin-bottom: 20px; }
+.live-metric { min-width: 0; background: var(--chart-surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
+.live-metric h3 { font-size: 13px; font-weight: 500; margin: 0; }
+.live-value { font-size: 24px; font-weight: 600; font-variant-numeric: tabular-nums; margin-top: 3px; }
+.live-metric .help { min-height: 36px; color: var(--ink-2); }
+.live-metric .legend { display: none; }
+.live-metric .empty { font-size: 12px; text-align: center; }
+.paused .live-metric .plot { opacity: .55; }
+#live-section .card-head { flex-wrap: wrap; }
+#proc-live-status { margin-bottom: 10px; }
+#historical { border-top: 1px solid var(--border); margin-top: 30px; padding-top: 24px; }
+#historical .controls { margin-left: 0; }
+@media (max-width: 1350px) { .live-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 760px) {
+  .live-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .live-metric { padding: 10px; }
+  .live-value { font-size: 21px; }
+  .segmented { flex-wrap: wrap; }
+  .brand { flex-wrap: wrap; }
+  .card-head { flex-wrap: wrap; }
+  .card-actions { flex-wrap: wrap; max-width: 100%; }
+  .strip-legend { flex-wrap: wrap; }
+}
+@media (pointer: coarse) { .live-controls label { min-height: 44px; } }
+
+.directional .help { min-height: 18px; margin-bottom: 8px; }
+.direction-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; font-size: 12px; }
+.direction-head > span { display: inline-flex; align-items: center; gap: 5px; }
+.direction-head strong { font-weight: 600; white-space: nowrap; }
+.direction-readouts { display: grid; gap: 3px; margin-bottom: 6px; }
+
+.smoothing-control { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; color: var(--ink-2); }
+.smoothing-control input { accent-color: var(--accent); }

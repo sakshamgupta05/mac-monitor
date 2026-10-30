@@ -190,7 +190,6 @@ fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
 
   let cfg = CollectorConfig {
     sample_ms: args.sample_ms,
-    live_sample_ms: args.live_sample_ms,
     alerts: AlertConfig {
       cpu_temp: args.alert_cpu_temp,
       disk_free_gb: args.alert_disk_free_gb,
@@ -207,7 +206,6 @@ fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     shared: shared.clone(),
     settings: Arc::new(server::Settings {
       sample_ms: args.sample_ms,
-      live_sample_ms: args.live_sample_ms,
       raw_retention_days: args.raw_retention_days,
       retention_days: args.retention_days,
       data_dir: data_dir.to_string_lossy().into(),

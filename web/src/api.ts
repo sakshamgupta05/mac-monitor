@@ -64,7 +64,24 @@ export interface MonitorEvent {
   detail: string;
 }
 
-export interface LiveInit {
+export interface LiveGroup {
+  name: string;
+  cpu: number;
+  mem: number;
+  power: number;
+  gpu: number;
+  disk_read: number;
+  disk_write: number;
+  count: number;
+}
+
+export interface LiveGroups {
+  groups: LiveGroup[];
+  groups_ts: number | null;
+}
+
+export interface LiveInit extends LiveGroups {
+  process_sample_secs: number;
   keys: string[];
   sample_ms: number;
   rows: [number, Values][];
