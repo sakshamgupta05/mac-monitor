@@ -60,6 +60,7 @@ pub enum LiveMsg {
   Keys(Arc<Vec<String>>),
   Row(i64, Arc<Vec<f32>>),
   Groups(i64, Arc<Vec<GroupStat>>),
+  Disks(Arc<Vec<host::DiskInfo>>),
 }
 
 /// Recent system samples for the live view, in a fixed key order that only grows.
@@ -109,6 +110,7 @@ pub struct Shared {
   pub live: Mutex<Live>,
   pub tx: broadcast::Sender<LiveMsg>,
   pub machine: Mutex<MachineInfo>,
+  pub disks: Mutex<Vec<host::DiskInfo>>,
   pub started: i64,
   pub last_sample: AtomicI64,
   pub shutdown: AtomicBool,
@@ -123,6 +125,7 @@ impl Shared {
       live: Mutex::new(Live { keep_ms: live_secs as i64 * 1000, ..Default::default() }),
       tx,
       machine: Mutex::new(MachineInfo::default()),
+      disks: Mutex::new(Vec::new()),
       started: now_secs(),
       last_sample: AtomicI64::new(0),
       shutdown: AtomicBool::new(false),
@@ -272,6 +275,12 @@ pub struct Collector {
 impl Collector {
   pub fn new(store: Arc<Store>, shared: Arc<Shared>, cfg: CollectorConfig) -> Self {
     let alerts = Alerts::new(cfg.alerts.clone());
+    if let Ok(Some(raw)) = store.get_meta("disk_devices")
+      && let Ok(mut disks) = serde_json::from_str::<Vec<host::DiskInfo>>(&raw)
+    {
+      for disk in &mut disks { disk.connected = false; }
+      *shared.disks.lock().unwrap() = disks;
+    }
     let now = now_secs();
     Collector {
       store,
@@ -336,6 +345,21 @@ impl Collector {
       }
 
       self.host.sample(&mut values);
+      if let Some(current) = self.host.take_disk_update() {
+        let mut catalog = self.shared.disks.lock().unwrap();
+        let mut updated = catalog.clone();
+        for disk in &mut updated { disk.connected = false; }
+        for disk in current {
+          if let Some(old) = updated.iter_mut().find(|d| d.id == disk.id) { *old = disk; }
+          else { updated.push(disk); }
+        }
+        updated.sort_by(|a, b| a.id.cmp(&b.id));
+        if *catalog != updated {
+          let _ = self.store.set_meta("disk_devices", &serde_json::to_string(&updated).unwrap());
+          let _ = self.shared.tx.send(LiveMsg::Disks(Arc::new(updated.clone())));
+          *catalog = updated;
+        }
+      }
       self.shared.last_sample.store(wall as i64, Ordering::Relaxed);
       self.publish_live((wall * 1000.0) as i64, &values);
 

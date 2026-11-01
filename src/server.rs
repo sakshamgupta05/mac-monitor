@@ -201,6 +201,7 @@ async fn meta(State(app): State<App>) -> Json<Value> {
     "db_bytes": app.store.disk_bytes(),
     "keys": app.store.keys(),
     "families": families,
+    "disks": *app.shared.disks.lock().unwrap(),
   }))
 }
 
@@ -232,10 +233,12 @@ struct Init<'a> {
   groups: &'a [crate::collector::procs::GroupStat],
   groups_ts: Option<i64>,
   process_sample_secs: u64,
+  disks: Vec<crate::collector::host::DiskInfo>,
 }
 
 async fn live(State(app): State<App>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
   let rx = app.shared.tx.subscribe();
+  let disks = app.shared.disks.lock().unwrap().clone();
   let init = {
     let live = app.shared.live.lock().unwrap();
     let rows = live.rows.iter().map(|(t, r)| (*t, finite(r))).collect();
@@ -244,6 +247,7 @@ async fn live(State(app): State<App>) -> Sse<impl Stream<Item = Result<Event, In
       sample_ms: app.settings.sample_ms,
       rows,
       process_sample_secs: crate::collector::LIVE_PROC_SECS,
+      disks,
       groups: &live.groups,
       groups_ts: live.groups_ts,
     })
@@ -268,6 +272,10 @@ async fn live(State(app): State<App>) -> Sse<impl Stream<Item = Result<Event, In
           Ok(LiveMsg::Groups(ts, groups)) => {
             let data = serde_json::to_string(&json!({ "ts": ts, "groups": *groups })).unwrap();
             return Some((Ok(Event::default().event("groups").data(data)), (rx, shutdown, None, client)));
+          }
+          Ok(LiveMsg::Disks(disks)) => {
+            let data = serde_json::to_string(&json!({ "disks": *disks })).unwrap();
+            return Some((Ok(Event::default().event("disks").data(data)), (rx, shutdown, None, client)));
           }
           Ok(LiveMsg::Keys(keys)) => {
             let data = serde_json::to_string(&json!({ "keys": *keys })).unwrap();

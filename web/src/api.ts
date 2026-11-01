@@ -14,7 +14,16 @@ export interface Machine {
   hostname: string;
 }
 
+export interface DiskInfo {
+  id: string;
+  name: string;
+  bsd: string;
+  kind: string;
+  connected: boolean;
+}
+
 export interface Meta {
+  disks: DiskInfo[];
   version: string;
   machine: Machine;
   now: number;
@@ -81,6 +90,7 @@ export interface LiveGroups {
 }
 
 export interface LiveInit extends LiveGroups {
+  disks?: DiskInfo[];
   process_sample_secs: number;
   keys: string[];
   sample_ms: number;

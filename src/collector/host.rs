@@ -57,17 +57,79 @@ impl Rate {
   }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DiskInfo {
+  pub id: String,
+  pub name: String,
+  pub bsd: String,
+  pub kind: String,
+  pub connected: bool,
+}
+
+struct Disk {
+  driver: IoObject,
+  registry_id: u64,
+  info: DiskInfo,
+  read: Rate,
+  write: Rate,
+}
+
+fn string_property(object: &IoObject, name: &str) -> Option<String> {
+  object.property(&CFString::new(name))?.downcast_into::<CFString>().map(|v| v.to_string())
+}
+
+fn dict_string(object: &IoObject, dict: &str, name: &str) -> Option<String> {
+  let dict = object.property(&CFString::new(dict))?.downcast_into::<CFDictionary>()?;
+  let key = CFString::new(name);
+  let value = *dict.find(key.as_CFTypeRef())?;
+  let value = unsafe { core_foundation::base::CFType::wrap_under_get_rule(value) };
+  value.downcast_into::<CFString>().map(|s| s.to_string())
+}
+
+// A stable, opaque series label. Never expose hardware serial numbers through the API.
+fn disk_identity(serial: Option<&str>, product: &str, boot: i64, registry_id: u64) -> String {
+  let identity = match serial.filter(|s| !s.trim().is_empty()) {
+    Some(serial) => format!("{product}\0{serial}"),
+    // Without a reliable hardware identifier, don't merge different devices that reuse diskN.
+    None => format!("attachment:{boot}:{registry_id}"),
+  };
+  let hash = identity.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+  format!("{hash:016x}")
+}
+
+fn describe_disk(driver: &IoObject) -> DiskInfo {
+  let registry_id = driver.registry_id();
+  let media = driver.children().and_then(|mut it| it.find(|child| string_property(child, "BSD Name").is_some()));
+  let bsd = media.as_ref().and_then(|m| string_property(m, "BSD Name")).unwrap_or_default();
+  let mut name = media.as_ref().map(IoObject::name).unwrap_or_else(|| "Block device".into());
+  if let Some(short) = name.strip_suffix(" Media") { name = short.to_string(); }
+  let parent = driver.parent();
+  let location = parent.as_ref().and_then(|p| dict_string(p, "Protocol Characteristics", "Physical Interconnect Location"));
+  let kind = match location.as_deref() { Some("Internal") => "Internal", Some("External") => "External", Some("File") => "Disk image", _ => "Other" }.to_string();
+  let mut serial = parent.as_ref().and_then(|p| dict_string(p, "Device Characteristics", "Serial Number"));
+  let mut ancestor = parent;
+  for _ in 0..12 {
+    let Some(node) = ancestor else { break };
+    if serial.as_ref().is_none_or(|s| s.trim().is_empty()) {
+      serial = string_property(&node, "USB Serial Number").or_else(|| string_property(&node, "Serial Number"));
+    }
+    if serial.as_ref().is_some_and(|s| !s.trim().is_empty()) { break; }
+    ancestor = node.parent();
+  }
+  let id = disk_identity(serial.as_deref(), &name, boot_time().unwrap_or(0), registry_id);
+  DiskInfo { id, name, bsd, kind, connected: true }
+}
+
 pub struct Host {
   host_port: libc::mach_port_t,
   page_size: u64,
   thermal_token: Option<c_int>,
-  disks: Vec<IoObject>,
+  disks: Vec<Disk>,
+  disk_update: Option<Vec<DiskInfo>>,
   disks_refreshed: Option<Instant>,
   if_names: HashMap<u16, String>,
   swap_in: Rate,
   swap_out: Rate,
-  disk_read: Rate,
-  disk_write: Rate,
   net_rx: Rate,
   net_tx: Rate,
 }
@@ -86,18 +148,17 @@ impl Host {
       page_size,
       thermal_token,
       disks: Vec::new(),
+      disk_update: None,
       disks_refreshed: None,
       if_names: HashMap::new(),
       swap_in: Rate::default(),
       swap_out: Rate::default(),
-      disk_read: Rate::default(),
-      disk_write: Rate::default(),
       net_rx: Rate::default(),
       net_tx: Rate::default(),
     }
   }
 
-  /// Fast metrics, sampled every second.
+  /// System metrics sampled at the shared collection cadence.
   pub fn sample(&mut self, out: &mut Vec<(String, f32)>) {
     let now = Instant::now();
     let mut push = |k: &str, v: f32| out.push((k.to_string(), v));
@@ -145,15 +206,6 @@ impl Host {
       }
     }
 
-    if let Some((read, write)) = self.disk_bytes(now) {
-      if let Some(r) = self.disk_read.update(now, read) {
-        push("disk.read", r);
-      }
-      if let Some(r) = self.disk_write.update(now, write) {
-        push("disk.write", r);
-      }
-    }
-
     if let Some((rx, tx)) = self.net_bytes() {
       if let Some(r) = self.net_rx.update(now, rx) {
         push("net.rx", r);
@@ -162,6 +214,7 @@ impl Host {
         push("net.tx", r);
       }
     }
+    self.disk_sample(now, out);
   }
 
   /// Slow metrics, sampled once per storage slot.
@@ -188,37 +241,50 @@ impl Host {
     (ret == 0).then_some(stats)
   }
 
-  /// Total bytes read and written by all block storage drivers.
-  fn disk_bytes(&mut self, now: Instant) -> Option<(u64, u64)> {
+  pub fn take_disk_update(&mut self) -> Option<Vec<DiskInfo>> {
+    self.disk_update.take()
+  }
+
+  /// Read each driver once, derive per-device rates and sum those same rates for All disks.
+  fn disk_sample(&mut self, now: Instant, out: &mut Vec<(String, f32)>) {
     let stale = self.disks_refreshed.is_none_or(|t| now.duration_since(t) > Duration::from_secs(60));
     if stale {
-      self.disks = matching_services(c"IOBlockStorageDriver").map(|it| it.collect()).unwrap_or_default();
+      if let Some(drivers) = matching_services(c"IOBlockStorageDriver") {
+        let mut previous = std::mem::take(&mut self.disks);
+        self.disks = drivers.map(|driver| {
+          let registry_id = driver.registry_id();
+          let info = describe_disk(&driver);
+          let (read, write) = previous.iter().position(|d| d.registry_id == registry_id)
+            .map(|i| { let d = previous.swap_remove(i); (d.read, d.write) }).unwrap_or_default();
+          Disk { driver, registry_id, info, read, write }
+        }).collect();
+        self.disk_update = Some(self.disks.iter().map(|d| d.info.clone()).collect());
+      }
       self.disks_refreshed = Some(now);
-      // Rates across a changed set of disks would jump.
-      self.disk_read = Rate::default();
-      self.disk_write = Rate::default();
     }
-
     let stats_key = CFString::from_static_string("Statistics");
     let read_key = CFString::from_static_string("Bytes (Read)");
     let write_key = CFString::from_static_string("Bytes (Write)");
-    let (mut read, mut write) = (0u64, 0u64);
-    for disk in &self.disks {
-      let Some(stats) = disk.property(&stats_key).and_then(|v| v.downcast_into::<CFDictionary>()) else {
-        continue;
+    let (mut read, mut write) = (0.0, 0.0);
+    let (mut has_read, mut has_write) = (false, false);
+    for disk in &mut self.disks {
+      let Some(stats) = disk.driver.property(&stats_key).and_then(|v| v.downcast_into::<CFDictionary>()) else { continue };
+      let get = |key: &CFString| -> Option<u64> {
+        let value = *stats.find(key.as_CFTypeRef())?;
+        let value = unsafe { core_foundation::base::CFType::wrap_under_get_rule(value) };
+        value.downcast_into::<CFNumber>()?.to_i64().map(|n| n.max(0) as u64)
       };
-      let get = |key: &CFString| -> u64 {
-        stats
-          .find(key.as_CFTypeRef())
-          .map(|v| unsafe { core_foundation::base::CFType::wrap_under_get_rule(*v) })
-          .and_then(|v| v.downcast_into::<CFNumber>())
-          .and_then(|n| n.to_i64())
-          .map_or(0, |n| n.max(0) as u64)
-      };
-      read += get(&read_key);
-      write += get(&write_key);
+      if let Some(value) = get(&read_key).and_then(|v| disk.read.update(now, v)) {
+        out.push((format!("disk.device_read:{}", disk.info.id), value));
+        read += value; has_read = true;
+      }
+      if let Some(value) = get(&write_key).and_then(|v| disk.write.update(now, v)) {
+        out.push((format!("disk.device_write:{}", disk.info.id), value));
+        write += value; has_write = true;
+      }
     }
-    (!self.disks.is_empty()).then_some((read, write))
+    if has_read { out.push(("disk.read".into(), read)); }
+    if has_write { out.push(("disk.write".into(), write)); }
   }
 
   /// Total bytes received and sent on `en*` interfaces (Ethernet, Wi-Fi). Tunnels such as
@@ -288,6 +354,16 @@ mod tests {
   }
 
   #[test]
+  fn disk_identity_survives_renumbering_but_never_reuses_unknown_attachments() {
+    let a = disk_identity(Some("serial-a"), "SSD", 100, 1);
+    assert_eq!(a, disk_identity(Some("serial-a"), "SSD", 200, 999));
+    assert_ne!(a, disk_identity(Some("serial-b"), "SSD", 100, 1));
+    assert!(!a.contains("serial-a"));
+    assert_ne!(disk_identity(None, "SSD", 100, 1), disk_identity(None, "SSD", 200, 1));
+    assert_ne!(disk_identity(None, "SSD", 100, 1), disk_identity(None, "SSD", 100, 2));
+  }
+
+  #[test]
   fn samples_on_this_machine() {
     let mut host = Host::new();
     let mut out = Vec::new();
@@ -300,6 +376,19 @@ mod tests {
     for k in ["mem.used", "mem.wired", "mem.pressure", "load.1", "disk.read", "net.rx", "disk.free"] {
       assert!(keys.contains(&k), "missing {k} in {keys:?}");
     }
+    for (total, family) in [("disk.read", "disk.device_read:"), ("disk.write", "disk.device_write:")] {
+      let sum: f32 = out.iter().filter(|(key, _)| key.starts_with(family)).map(|(_, v)| *v).sum();
+      assert_eq!(sum, out.iter().find(|(key, _)| key == total).unwrap().1);
+    }
+    let disks = host.take_disk_update().unwrap();
+    assert!(!disks.is_empty());
+    assert_eq!(disks.iter().map(|d| &d.id).collect::<std::collections::HashSet<_>>().len(), disks.len());
+    assert!(disks.iter().all(|d| !d.id.is_empty() && d.connected));
+    // Re-discovery must retain baselines for unchanged drivers, not drop a sample every minute.
+    host.disks_refreshed = Some(Instant::now() - Duration::from_secs(61));
+    let mut refreshed = Vec::new();
+    host.sample(&mut refreshed);
+    assert!(refreshed.iter().any(|(key, _)| key == "disk.read"));
     let used = out.iter().find(|(k, _)| k == "mem.used").unwrap().1;
     assert!(used > 1e9, "mem.used {used}");
     assert!(boot_time().unwrap() > 1_600_000_000);

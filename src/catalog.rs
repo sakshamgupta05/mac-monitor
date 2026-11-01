@@ -54,6 +54,8 @@ pub const FAMILIES: &[Family] = &[
   f("load.1", "load", None, "1-minute load average"),
   f("disk.read", "B/s", None, "Disk read rate, all block devices"),
   f("disk.write", "B/s", None, "Disk write rate, all block devices"),
+  f("disk.device_read", "B/s", Some("disk"), "Disk read rate per device"),
+  f("disk.device_write", "B/s", Some("disk"), "Disk write rate per device"),
   f("disk.free", "B", None, "Free space on the data volume"),
   f("disk.total", "B", None, "Size of the data volume"),
   f("net.rx", "B/s", None, "Network receive rate (en* interfaces)"),

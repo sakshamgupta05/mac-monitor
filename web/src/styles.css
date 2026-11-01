@@ -927,3 +927,12 @@ dialog input {
 
 .smoothing-control { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; color: var(--ink-2); }
 .smoothing-control input { accent-color: var(--accent); }
+
+.live-metric-title { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.disk-picker { font: inherit; color: var(--ink); background: var(--chart-surface); border: 1px solid var(--border); border-radius: 5px; padding: 3px 5px; min-width: 0; max-width: 180px; text-overflow: ellipsis; }
+.live-metric-title .disk-picker { max-width: 65%; font-size: 12px; }
+
+/* Continuous, relative emphasis without changing values or row heights. */
+.proc-table td { position: relative; }
+.proc-data-bar { position: absolute; left: 6px; top: calc(50% - 9px); height: 18px; width: calc((100% - 12px) * var(--share)); background: var(--s1); opacity: .15; border-radius: 2px; pointer-events: none; }
+.proc-cell-value { position: relative; z-index: 1; }

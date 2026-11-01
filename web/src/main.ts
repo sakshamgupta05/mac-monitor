@@ -1,7 +1,7 @@
 import "uplot/dist/uPlot.min.css";
 import "./styles.css";
 
-import { type LiveGroup, type LiveGroups, type LiveInit, type Meta, type MonitorEvent, type RangeData, type Summary, type Values, api } from "./api";
+import { type DiskInfo, type LiveGroup, type LiveGroups, type LiveInit, type Meta, type MonitorEvent, type RangeData, type Summary, type Values, api } from "./api";
 import { Chart, type Line, type Marker, Strip, css, sparkline } from "./chart";
 import * as F from "./format";
 import type { Unit } from "./format";
@@ -55,6 +55,9 @@ const now = () => Math.floor(Date.now() / 1000);
 // Deliberately session-only and opt-in: visiting a URL never accelerates collection.
 let liveEnabled = false;
 let smoothHistory = localStorage.getItem("mm.smoothHistory") === "true";
+let diskCatalog: DiskInfo[] = [];
+let liveDisk = "";
+let historyDisk = "";
 let liveWindow = 120;
 let liveDirectionLayout = "mirrored";
 let liveSampleMs = 2000;
@@ -391,6 +394,7 @@ function tile(id: string, label: string): HTMLElement {
 }
 
 function buildLayout(): void {
+  diskCatalog = meta.disks ?? [];
   const panels = hostPanels(meta);
   const root = $("app");
   root.replaceChildren();
@@ -452,7 +456,9 @@ function buildLayout(): void {
     }
     for (const p of panels[s.id] ?? []) {
       panelDefs.set(p.id, p);
-      grid.append(card(p.id, p.title, p.help, { wide: p.wide }));
+      const panel = card(p.id, p.title, p.help, { wide: p.wide });
+      if (p.id === "disk") panel.querySelector(".card-actions")!.prepend(diskPicker("history"));
+      grid.append(panel);
     }
     if (s.id === "processes") buildProcesses(grid);
     if (s.id === "events") buildEvents(grid);
@@ -629,8 +635,9 @@ function hostKeys(): { keys: string[]; minmax: string[] } {
   const minmax = new Set<string>(["mem.pressure", "thermal.pressure"]);
   for (const p of panelDefs.values()) {
     for (const l of p.lines) {
-      keys.add(l.key);
-      if (l.band) minmax.add(l.key);
+      const key = p.id === "disk" ? diskKey(l.key, historyDisk) : l.key;
+      keys.add(key);
+      if (l.band) minmax.add(key);
     }
   }
   return { keys: [...keys], minmax: [...minmax] };
@@ -646,8 +653,9 @@ function renderHost(data: RangeData): void {
   for (const [id, p] of panelDefs) {
     const lines: Line[] = [];
     p.lines.forEach((l, i) => {
-      const s = data.series[l.key];
-      if (!s && !meta.keys.includes(l.key)) return;
+      const key = id === "disk" ? diskKey(l.key, historyDisk) : l.key;
+      const s = data.series[key];
+      if (!s && !meta.keys.includes(key)) return;
       lines.push({
         label: l.label,
         color: slot(i),
@@ -667,8 +675,9 @@ function renderHost(data: RangeData): void {
 
 async function loadHost(from: number, to: number): Promise<void> {
   const { keys, minmax } = hostKeys();
+  const disk = historyDisk;
   const data = await api.range({ keys, from, to, points: plotPoints(), minmax });
-  renderHost(data);
+  if (disk === historyDisk) renderHost(data);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -684,6 +693,7 @@ function startLive(): void {
   source = new EventSource("/api/live");
   source.addEventListener("init", (e) => {
     const init = JSON.parse((e as MessageEvent).data) as LiveInit;
+    updateDiskCatalog(init.disks ?? diskCatalog);
     liveKeys = init.keys;
     liveRows = init.rows;
     liveGroups = { groups: init.groups, groups_ts: init.groups_ts };
@@ -691,6 +701,10 @@ function startLive(): void {
     liveProcessSecs = init.process_sample_secs;
     renderLiveProcTable();
     scheduleLive();
+  });
+  source.addEventListener("disks", (e) => {
+    updateDiskCatalog(JSON.parse((e as MessageEvent).data).disks);
+    renderLive();
   });
   source.addEventListener("groups", (e) => {
     const snapshot = JSON.parse((e as MessageEvent).data) as { ts: number; groups: LiveGroup[] };
@@ -741,24 +755,43 @@ function renderLive(): void {
   const rows = liveRows.filter(([t]) => t / 1000 >= end - liveWindow);
   const ts = rows.map(([t]) => t / 1000);
   for (const def of LIVE_PANELS) {
-    const value = (key: string) => liveValue(key);
-    const v = value(def.keys[0]);
+    const keys = def.id === "disk" ? def.keys.map((key) => diskKey(key, liveDisk)) : def.keys;
+    const value = (key: string) => {
+      if (def.id === "disk" && liveDisk) {
+        if (!diskCatalog.some((d) => d.id === liveDisk && d.connected)) return null;
+        return liveRows[liveRows.length - 1]?.[1][liveKeys.indexOf(key)] ?? null;
+      }
+      return liveValue(key);
+    };
+    const v = value(keys[0]);
     let text = F.fmt(def.unit, v);
     let sub = "";
     if (def.id === "mem") {
-      const total = value("mem.total");
-      sub = `${total != null ? `of ${F.bytes(total)} · ` : ""}${value("mem.pressure") == null ? "" : ["Normal", "Warning", "Critical"][Math.min(2, Math.round(value("mem.pressure")!))] + " pressure"}`;
+      const ram = value("mem.used");
+      const swap = value("swap.used");
+      text = F.fmt("B", ram != null && swap != null ? ram + swap : null);
+      sub = `RAM ${F.fmt("B", ram)} · Swap ${F.fmt("B", swap)}${value("mem.pressure") == null ? "" : ` · ${["Normal", "Warning", "Critical"][Math.min(2, Math.round(value("mem.pressure")!))]} pressure`}`;
     } else if (def.keys.length === 2) {
-      const a = value(def.keys[0]);
-      const b = value(def.keys[1]);
+      const a = value(keys[0]);
+      const b = value(keys[1]);
       $(`live-rate-${def.id}-0`).textContent = F.fmt(def.unit, a);
       $(`live-rate-${def.id}-1`).textContent = F.fmt(def.unit, b);
       sub = liveDirectionLayout === "mirrored" ? "6s average · mirrored" : "6s average · overlay";
     } else if (def.id === "power") sub = `CPU ${F.fmt("C", value("temp.cpu"))} · GPU ${F.fmt("C", value("temp.gpu"))}`;
     else sub = def.id === "cpu" ? "Across all cores" : "Share of GPU time";
     if (def.keys.length === 1) $(`live-value-${def.id}`).textContent = text;
+    if (def.id === "disk" && liveDisk && !diskCatalog.some((d) => d.id === liveDisk && d.connected)) sub = "Disconnected · recent samples retained";
     $(`live-sub-${def.id}`).textContent = sub;
-    const lines = def.keys.map((key, i) => ({ label: def.labels[i], color: slot(i), values: rows.map((r) => r[1][liveKeys.indexOf(key)] ?? null) }));
+    const lines = keys.map((key, i) => ({ label: def.labels[i], color: slot(i), values: rows.map((r) => r[1][liveKeys.indexOf(key)] ?? null) }));
+    if (def.id === "mem") {
+      const ramIndex = liveKeys.indexOf("mem.used");
+      const swapIndex = liveKeys.indexOf("swap.used");
+      lines[0].values = rows.map((row) => {
+        const ram = row[1][ramIndex];
+        const swap = row[1][swapIndex];
+        return ram != null && swap != null ? ram + swap : null;
+      });
+    }
     if (def.keys.length === 2) {
       const smoothed = lines.map((line) => ({ ...line, label: `${line.label} · 6s average`, values: movingAverage(ts, line.values, 6) }));
       const peak = smoothed.reduce((max, line) => line.values.reduce<number>((m, v) => Math.max(m, v ?? 0), max), 0);
@@ -788,6 +821,51 @@ function movingAverage(ts: number[], values: Values, seconds: number): Values {
   });
 }
 
+function diskKey(key: string, disk: string): string {
+  return disk ? `${key === "disk.read" ? "disk.device_read" : "disk.device_write"}:${disk}` : key;
+}
+
+function diskPicker(mode: "live" | "history"): HTMLSelectElement {
+  const picker = h("select", { id: `${mode}-disk`, "aria-label": mode === "live" ? "Live disk" : "Historical disk", class: "disk-picker" });
+  populateDiskPicker(picker, mode);
+  picker.addEventListener("change", () => {
+    picker.title = picker.selectedOptions[0]?.textContent ?? "All disks";
+    if (mode === "live") { liveDisk = picker.value; renderLive(); }
+    else {
+      historyDisk = picker.value;
+      $("card-disk").querySelector(".help")!.textContent = historyDisk ? "Selected device throughput. Per-disk history starts when this version began recording." : "Bytes read and written by all block devices, including disk images.";
+      restart();
+    }
+  });
+  return picker;
+}
+
+function populateDiskPicker(picker: HTMLSelectElement, mode: "live" | "history"): void {
+  const selected = mode === "live" ? liveDisk : historyDisk;
+  const options = [h("option", { value: "" }, "All disks")];
+  const disks = diskCatalog.filter((d) => mode === "history" || d.connected || d.id === selected)
+    .sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+  for (const disk of disks) {
+    const label = `${disk.name}${disk.bsd ? ` · ${disk.bsd}` : ""} · ${disk.kind}${disk.connected ? "" : " (disconnected)"}`;
+    const option = h("option", { value: disk.id }, label);
+    option.disabled = mode === "live" && !disk.connected;
+    options.push(option);
+  }
+  // Retain the choice across metadata refreshes; never silently substitute another device.
+  if (selected && !disks.some((d) => d.id === selected)) options.push(h("option", { value: selected }, "Selected disk (unavailable)"));
+  picker.replaceChildren(...options);
+  picker.value = selected;
+  picker.title = picker.selectedOptions[0]?.textContent ?? "All disks";
+}
+
+function updateDiskCatalog(disks: DiskInfo[]): void {
+  diskCatalog = disks;
+  for (const mode of ["live", "history"] as const) {
+    const picker = document.getElementById(`${mode}-disk`) as HTMLSelectElement | null;
+    if (picker) populateDiskPicker(picker, mode);
+  }
+}
+
 function liveValue(key: string): number | null {
   const i = liveKeys.indexOf(key);
   if (i < 0) return null;
@@ -799,7 +877,7 @@ function liveValue(key: string): number | null {
 
 const LIVE_PANELS: { id: string; title: string; keys: string[]; labels: string[]; unit: Unit }[] = [
   { id: "cpu", title: "CPU", keys: ["cpu.active"], labels: ["All cores"], unit: "ratio" },
-  { id: "mem", title: "Memory", keys: ["mem.used"], labels: ["Used"], unit: "B" },
+  { id: "mem", title: "RAM + swap", keys: ["mem.used"], labels: ["RAM + swap"], unit: "B" },
   { id: "gpu", title: "GPU", keys: ["gpu.active"], labels: ["Active"], unit: "ratio" },
   { id: "disk", title: "Disk", keys: ["disk.read", "disk.write"], labels: ["Read", "Write"], unit: "B/s" },
   { id: "net", title: "Network", keys: ["net.rx", "net.tx"], labels: ["Received", "Sent"], unit: "B/s" },
@@ -823,8 +901,9 @@ function buildLiveLayout(root: HTMLElement): void {
   root.append(section);
   for (const p of LIVE_PANELS) {
     const plot = h("div", { id: `live-chart-${p.id}` });
+    if (p.id === "mem") plot.title = "RAM in use plus disk-backed swap. The reference marks physical RAM; this sum is not RAM usage or memory pressure.";
     const paired = p.keys.length === 2;
-    grid.append(h("article", { class: `live-metric${paired ? " directional" : ""}`, id: `live-metric-${p.id}` }, h("h3", {}, p.title), paired ? null : h("div", { class: "live-value", id: `live-value-${p.id}` }, "–"), h("p", { class: "help", id: `live-sub-${p.id}` }, "Waiting for live samples"), plot));
+    grid.append(h("article", { class: `live-metric${paired ? " directional" : ""}`, id: `live-metric-${p.id}` }, p.id === "disk" ? h("div", { class: "live-metric-title" }, h("h3", {}, p.title), diskPicker("live")) : h("h3", {}, p.title), paired ? null : h("div", { class: "live-value", id: `live-value-${p.id}` }, "–"), h("p", { class: "help", id: `live-sub-${p.id}` }, "Waiting for live samples"), plot));
     const xRange = (): [number, number] => {
       const end = (liveRows[liveRows.length - 1]?.[0] ?? Date.now()) / 1000;
       return [end - liveWindow, end];
@@ -840,7 +919,14 @@ function buildLiveLayout(root: HTMLElement): void {
       liveCharts.set(p.id, new Chart(plot, { unit: p.unit, compact: true, area: true, height: 110, hideTimeAxis: true, capacity: false, mirrored: () => liveDirectionLayout === "mirrored", yMax: () => liveRateScales.get(p.id) ?? 1024, xRange }));
     } else {
       liveCharts.set(p.id, new Chart(plot, { unit: p.unit, compact: true, area: true, height: 110,
-        yMax: p.id === "mem" ? () => liveValue("mem.total") ?? (meta.machine.memory_gb ? meta.machine.memory_gb * 1024 ** 3 : null) : undefined,
+        tooltipExtra: p.id === "mem" ? () => {
+          const physical = liveValue("mem.total") ?? (meta.machine.memory_gb ? meta.machine.memory_gb * 1024 ** 3 : null);
+          return physical ? `Physical RAM: ${F.bytes(physical)}` : null;
+        } : undefined,
+        reference: p.id === "mem" ? () => {
+          const physical = liveValue("mem.total") ?? (meta.machine.memory_gb ? meta.machine.memory_gb * 1024 ** 3 : null);
+          return physical ? { value: physical, label: `${F.axis("B", physical)} RAM` } : null;
+        } : undefined,
         y: p.unit === "ratio" ? "ratio" : "zero", xRange,
       }));
     }
@@ -1177,6 +1263,15 @@ function processTable<R extends { name: string }>(
   live = false,
 ): HTMLElement {
   const filter = live ? liveProcFilter : procFilter;
+  // Normalize against the full snapshot/range so filtering doesn't change the visual scale.
+  const maxima = new Map<keyof R, number>();
+  for (const col of columns) {
+    if (col.id === "name" || col.id === "count") continue;
+    maxima.set(col.id, data.reduce((max, row) => {
+      const value = row[col.id];
+      return typeof value === "number" && Number.isFinite(value) ? Math.max(max, value) : max;
+    }, 0));
+  }
   const rows = data
     .filter((r) => !filter || r.name.toLowerCase().includes(filter))
     .sort((a, b) => {
@@ -1185,12 +1280,12 @@ function processTable<R extends { name: string }>(
       const c = typeof x === "string" ? x.localeCompare(y as string) : (x as number) - (y as number);
       return sort.desc ? -c : c;
     });
-  const table = h("table", { class: "proc-table" });
+  const table = h("table", { class: "proc-table", "aria-description": "Soft bars compare consumers within each resource column, not machine capacity or stress." });
   const head = h("tr");
   for (const col of columns) {
     const active = sort.col === col.id;
     const th = h("th", {
-      title: col.title,
+      title: `${col.title}${maxima.has(col.id) ? ". Bar lengths compare consumers in this column, not capacity or stress." : ""}`,
       class: col.id === "name" ? "" : "num",
       "aria-sort": active ? (sort.desc ? "descending" : "ascending") : "none",
     });
@@ -1209,7 +1304,20 @@ function processTable<R extends { name: string }>(
   for (const r of rows) {
     const tr = h("tr", r.name === "other" ? { class: "other-row" } : {});
     for (const col of columns) {
-      tr.append(h("td", { class: col.id === "name" ? "name" : "num" }, col.id === "name" && r.name === "other" ? "Other (small groups)" : col.fmt(r)));
+      const value = col.id === "name" && r.name === "other" ? "Other (small groups)" : col.fmt(r);
+      const td = h("td", { class: col.id === "name" ? "name" : "num" });
+      const max = maxima.get(col.id) ?? 0;
+      const numeric = r[col.id];
+      if (max > 0 && typeof numeric === "number" && Number.isFinite(numeric) && numeric > 0) {
+        const share = Math.min(1, numeric / max);
+        const bar = h("span", { class: "proc-data-bar", "aria-hidden": "true" });
+        bar.style.setProperty("--share", String(share));
+        td.classList.add("has-data-bar");
+        td.title = `${Math.round(share * 100)}% of the largest value in this column; not a capacity percentage.`;
+        td.append(bar);
+      }
+      td.append(h("span", { class: "proc-cell-value" }, value));
+      tr.append(td);
     }
     tbody.append(tr);
   }
@@ -1315,7 +1423,7 @@ function renderOverhead(): void {
     h("dt", {}, "Data directory"),
     h("dd", { class: "mono" }, meta.data_dir),
   );
-  const table = h("table", { class: "proc-table" });
+  const table = h("table", { class: "proc-table", "aria-description": "Soft bars compare consumers within each resource column, not machine capacity or stress." });
   table.append(
     h("thead", {}, h("tr", {}, h("th", {}, "Process"), h("th", { class: "num" }, "CPU avg"), h("th", { class: "num" }, "CPU peak"), h("th", { class: "num" }, "Memory avg"), h("th", { class: "num" }, "Energy"))),
   );
@@ -1351,7 +1459,7 @@ async function refresh(): Promise<void> {
   setStatus("Updating…", "loading");
   document.body.classList.add("loading");
   try {
-    const metaP = api.meta().then((m) => (meta = m));
+    const metaP = api.meta().then((m) => { meta = m; updateDiskCatalog(m.disks ?? []); });
     await Promise.all([
       loadHost(from, to),
       loadSummary(from, to),

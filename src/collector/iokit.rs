@@ -11,6 +11,9 @@ use core_foundation::string::{CFString, CFStringRef};
 unsafe extern "C" {
   fn IOServiceMatching(name: *const c_char) -> CFDictionaryRef;
   fn IOServiceGetMatchingServices(main_port: u32, matching: CFDictionaryRef, existing: *mut u32) -> c_int;
+  fn IORegistryEntryGetParentEntry(entry: u32, plane: *const c_char, parent: *mut u32) -> c_int;
+  fn IORegistryEntryGetRegistryEntryID(entry: u32, id: *mut u64) -> c_int;
+  fn IORegistryEntryGetName(entry: u32, name: *mut c_char) -> c_int;
   fn IORegistryEntryGetChildIterator(entry: u32, plane: *const c_char, iterator: *mut u32) -> c_int;
   fn IORegistryEntryCreateCFProperty(entry: u32, key: CFStringRef, allocator: CFAllocatorRef, options: u32) -> CFTypeRef;
   fn IOIteratorNext(iterator: u32) -> u32;
@@ -35,6 +38,23 @@ impl IoObject {
     let key = key.as_concrete_TypeRef();
     let value = unsafe { IORegistryEntryCreateCFProperty(self.0, key, kCFAllocatorDefault, 0) };
     (!value.is_null()).then(|| unsafe { CFType::wrap_under_create_rule(value) })
+  }
+
+  pub fn parent(&self) -> Option<IoObject> {
+    let mut parent = 0;
+    (unsafe { IORegistryEntryGetParentEntry(self.0, c"IOService".as_ptr(), &mut parent) } == 0).then_some(IoObject(parent))
+  }
+
+  pub fn registry_id(&self) -> u64 {
+    let mut id = 0;
+    unsafe { IORegistryEntryGetRegistryEntryID(self.0, &mut id) };
+    id
+  }
+
+  pub fn name(&self) -> String {
+    let mut name = [0 as c_char; 128];
+    if unsafe { IORegistryEntryGetName(self.0, name.as_mut_ptr()) } != 0 { return String::new(); }
+    unsafe { CStr::from_ptr(name.as_ptr()) }.to_string_lossy().into_owned()
   }
 
   /// Children in the service plane.

@@ -31,6 +31,8 @@ export interface ChartOptions {
   smooth?: () => boolean;
   /** A capacity ceiling, e.g. physical RAM; evaluated on each update. */
   yMax?: () => number | null;
+  /** A labeled physical reference; the scale can extend above it. */
+  reference?: () => { value: number; label: string } | null;
   /** False when a supplied ceiling is an automatic shared scale rather than capacity. */
   capacity?: boolean;
   hideTimeAxis?: boolean;
@@ -271,6 +273,11 @@ export class Chart {
 
     const yMode = this.o.y ?? "zero";
     const yRange: uPlot.Range.Function = (_u, min, max) => {
+      const reference = this.o.reference?.();
+      if (reference && reference.value > 0) {
+        const unit = this.o.unit === "B" ? 1024 ** 3 : 1;
+        return [0, niceCeil(Math.max(reference.value, max ?? 0) / unit * 1.10) * unit];
+      }
       const capacity = this.o.yMax?.();
       if (capacity != null && capacity > 0) return [this.o.mirrored?.() ? -capacity : 0, capacity];
       if (yMode === "ratio") return [0, this.o.compact ? 1 : Math.max(1, max ?? 1)];
@@ -325,6 +332,7 @@ export class Chart {
             }
           },
         ],
+        drawAxes: [(u) => this.drawReference(u)],
         draw: [(u) => {
           this.drawMarkers(u);
           if (this.o.compact) {
@@ -333,7 +341,9 @@ export class Chart {
             this.root.dataset.scaleMin = String(lo);
             this.root.dataset.scaleMax = String(hi);
             this.root.setAttribute("role", "img");
-            this.root.setAttribute("aria-label", `${this.lines.map((l) => `${l.label}${l.invert ? " below zero" : this.o.mirrored?.() ? " above zero" : ""}`).join(" and ")}: scale ${fmt(this.o.unit, this.o.mirrored?.() ? 0 : lo)} to ${fmt(this.o.unit, hi)}${(this.o.yMax && this.o.capacity !== false) || this.o.y === "ratio" ? ", capacity" : ", automatically scaled"}`);
+            const reference = this.o.reference?.();
+            if (reference) this.root.dataset.referenceValue = String(reference.value);
+            this.root.setAttribute("aria-label", `${this.lines.map((l) => `${l.label}${l.invert ? " below zero" : this.o.mirrored?.() ? " above zero" : ""}`).join(" and ")}: scale ${fmt(this.o.unit, this.o.mirrored?.() ? 0 : lo)} to ${fmt(this.o.unit, hi)}${(this.o.yMax && this.o.capacity !== false) || this.o.y === "ratio" ? ", capacity" : ", automatically scaled"}${reference ? `; ${reference.label} reference` : ""}`);
           }
         }],
       },
@@ -341,6 +351,23 @@ export class Chart {
     this.u = new uPlot(opts, data, this.plotEl);
     this.u.over.append(this.tipEl);
     this.u.over.addEventListener("mouseleave", () => this.updateReadout(null));
+  }
+
+  private drawReference(u: uPlot): void {
+    const reference = this.o.reference?.();
+    if (!reference || reference.value < (u.scales.y.min ?? 0) || reference.value > (u.scales.y.max ?? 0)) return;
+    const ctx = u.ctx;
+    const dpr = devicePixelRatio;
+    const { left, width } = u.bbox;
+    const y = u.valToPos(reference.value, "y", true);
+    ctx.save();
+    // Behind the data, with no label or opaque box over the time series.
+    ctx.strokeStyle = css("--ink-2");
+    ctx.globalAlpha = 0.55;
+    ctx.lineWidth = 0.9 * dpr;
+    ctx.setLineDash([dpr, 3 * dpr]);
+    ctx.beginPath(); ctx.moveTo(left, y); ctx.lineTo(left + width, y); ctx.stroke();
+    ctx.restore();
   }
 
   private drawMarkers(u: uPlot): void {

@@ -148,10 +148,14 @@ test("live snapshots replace exited groups; sorting, filters, pause and visibili
   await emit("init", { keys: ["mem.used", "cpu.active"], rows: [[Date.now(), [1024 ** 3, .25]]], sample_ms: 2000, process_sample_secs: 5, groups_ts: 100, groups: [app("First", .5, 200), app("Second", 1, 100)] });
   const table = page.locator("#card-live-procs");
   await expect(table.locator("tbody tr").first()).toContainText("Second");
+  await expect(table.locator("tbody tr").first().locator("td:nth-child(2) .proc-data-bar")).toHaveCSS("--share", "1");
+  await expect(table.locator("tbody tr").first().locator("td:nth-child(4) .proc-data-bar")).toHaveCount(0);
+  await expect(table.locator("tbody tr").first().locator("td:last-child .proc-data-bar")).toHaveCount(0);
   await table.getByRole("button", { name: "Memory now" }).click();
   await expect(table.locator("tbody tr").first()).toContainText("First");
   await page.getByLabel("Filter live process groups").fill("second");
   await expect(table.locator("tbody tr")).toHaveCount(1);
+  await expect(table.locator("tbody tr td:nth-child(3) .proc-data-bar")).toHaveCSS("--share", "0.5");
   await emit("groups", { ts: 105, groups: [app("First", .1, 200)] });
   await expect(table).toContainText("No groups match");
   await page.getByLabel("Filter live process groups").fill("");
@@ -177,7 +181,7 @@ test("live snapshots replace exited groups; sorting, filters, pause and visibili
   await expect(table).toContainText("Paused");
 });
 
-test("live area charts show stable CPU, GPU and physical-memory capacity scales", async ({ page }) => {
+test("live area charts retain CPU/GPU scales and allow RAM plus swap beyond physical RAM", async ({ page }) => {
   await page.addInitScript(() => {
     (window as any).EventSource = class extends EventTarget {
       constructor() { super(); (window as any).chartSource = this; }
@@ -191,10 +195,10 @@ test("live area charts show stable CPU, GPU and physical-memory capacity scales"
     const now = Date.now();
     source.dispatchEvent(new Event("open"));
     source.dispatchEvent(new MessageEvent("init", { data: JSON.stringify({
-      keys: ["cpu.active", "gpu.active", "mem.used", "mem.total", "power.sys", "disk.read", "disk.write", "net.rx", "net.tx"],
+      keys: ["cpu.active", "gpu.active", "mem.used", "mem.total", "power.sys", "disk.read", "disk.write", "net.rx", "net.tx", "swap.used"],
       sample_ms: 2000, process_sample_secs: 5, groups: [], groups_ts: null,
       rows: Array.from({ length: 61 }, (_, i) => [now - (60 - i) * 2000,
-        [.25 + Math.sin(i / 8) * .10, .125, 24 * 1024 ** 3, 32 * 1024 ** 3, 25 + Math.sin(i / 6) * 4, 1024 ** 2, 512 * 1024, 256 * 1024, 128 * 1024]]),
+        [.25 + Math.sin(i / 8) * .10, .125, 24 * 1024 ** 3, 32 * 1024 ** 3, 25 + Math.sin(i / 6) * 4, 1024 ** 2, 512 * 1024, 256 * 1024, 128 * 1024, 8 * 1024 ** 3]]),
     }) }));
   });
   const cpu = page.locator("#live-chart-cpu");
@@ -203,9 +207,16 @@ test("live area charts show stable CPU, GPU and physical-memory capacity scales"
   await expect(cpu).toHaveAttribute("data-scale-min", "0");
   await expect(cpu).toHaveAttribute("data-scale-max", "1");
   await expect(gpu).toHaveAttribute("data-scale-max", "1");
-  await expect(mem).toHaveAttribute("data-scale-max", String(32 * 1024 ** 3));
+  await expect(mem).toHaveAttribute("data-reference-value", String(32 * 1024 ** 3));
+  expect(Number(await mem.getAttribute("data-scale-max"))).toBeGreaterThan(32 * 1024 ** 3);
   await expect(cpu).toHaveAttribute("aria-label", /100%.*capacity/);
-  await expect(mem).toHaveAttribute("aria-label", /32.0 GB.*capacity/);
+  await expect(mem).toHaveAttribute("aria-label", /RAM \+ swap.*32 GB RAM reference/);
+  await expect(page.locator("#live-value-mem")).toHaveText("32.0 GB");
+  await expect(page.locator("#live-sub-mem")).toContainText("RAM 24.0 GB · Swap 8.00 GB");
+  const memoryOver = page.locator("#live-chart-mem .u-over");
+  const memoryBox = (await memoryOver.boundingBox())!;
+  await page.mouse.move(memoryBox.x + memoryBox.width / 2, memoryBox.y + memoryBox.height / 2);
+  await expect(page.locator("#live-chart-mem .tip")).toContainText("Physical RAM: 32.0 GB");
   await expect(page.locator("#live-chart-power")).toHaveAttribute("aria-label", /automatically scaled/);
   const initialOver = page.locator("#live-chart-disk .u-over");
   const initialBox = (await initialOver.boundingBox())!;
@@ -219,10 +230,10 @@ test("live area charts show stable CPU, GPU and physical-memory capacity scales"
   await page.evaluate(() => {
     const now = Date.now();
     (window as any).chartSource.dispatchEvent(new MessageEvent("init", { data: JSON.stringify({
-      keys: ["cpu.active", "gpu.active", "mem.used", "mem.total", "power.sys", "disk.read", "disk.write", "net.rx", "net.tx"],
+      keys: ["cpu.active", "gpu.active", "mem.used", "mem.total", "power.sys", "disk.read", "disk.write", "net.rx", "net.tx", "swap.used"],
       sample_ms: 2000, process_sample_secs: 5, groups: [], groups_ts: null,
       rows: Array.from({ length: 61 }, (_, i) => [now - (60 - i) * 2000,
-        [.25, .125, 24 * 1024 ** 3, 32 * 1024 ** 3, 25, i === 59 ? 90 * 1024 ** 2 : 0, 0, 0, 0]]),
+        [.25, .125, 24 * 1024 ** 3, 32 * 1024 ** 3, 25, i === 59 ? 90 * 1024 ** 2 : 0, 0, 0, 0, 8 * 1024 ** 3]]),
     }) }));
   });
   // A 90 MB/s spike becomes a 30 MB/s trend over three 2-second samples.
@@ -251,18 +262,95 @@ test("live area charts show stable CPU, GPU and physical-memory capacity scales"
 
   await page.evaluate(() => {
     (window as any).chartSource.dispatchEvent(new MessageEvent("row", { data: JSON.stringify({
-      t: Date.now() + 1000, v: [.95, .9, 12 * 1024 ** 3, 32 * 1024 ** 3, 15, 0, 0, 0, 0],
+      t: Date.now() + 1000, v: [.95, .9, 31 * 1024 ** 3, 32 * 1024 ** 3, 15, 0, 0, 0, 0, 6 * 1024 ** 3],
     }) }));
   });
   await expect(page.locator("#live-value-cpu")).toHaveText("95%");
+  await expect(page.locator("#live-value-mem")).toHaveText("37.0 GB");
+  await expect(page.locator("#live-sub-mem")).toContainText("RAM 31.0 GB · Swap 6.00 GB");
+  expect(Number(await mem.getAttribute("data-scale-max"))).toBeGreaterThan(37 * 1024 ** 3);
+  await page.mouse.move(0, 0);
+  await page.screenshot({ path: "test-results/memory-over-physical.png" });
   await expect(cpu).toHaveAttribute("data-scale-max", "1");
-  await expect(mem).toHaveAttribute("data-scale-max", String(32 * 1024 ** 3));
+  await expect(mem).toHaveAttribute("data-reference-value", String(32 * 1024 ** 3));
+  expect(Number(await mem.getAttribute("data-scale-max"))).toBeGreaterThan(32 * 1024 ** 3);
   await page.locator("#theme").click();
   await expect(cpu).toHaveAttribute("data-scale-max", "1");
   await page.setViewportSize({ width: 390, height: 844 });
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await page.screenshot({ path: "test-results/live-area-scales-mobile.png" });
   await page.locator("#live-toggle").uncheck();
+});
+
+test("disk selectors default to All, isolate devices and retain disconnected selections", async ({ page }) => {
+  const errors = collectErrors(page);
+  const disks = [
+    { id: "internal", name: "Internal SSD", bsd: "disk0", kind: "Internal", connected: true },
+    { id: "external", name: "Samsung T7", bsd: "disk6", kind: "External", connected: true },
+  ];
+  const queries: string[] = [];
+  await page.route("**/api/meta", async (route) => {
+    const response = await route.fetch();
+    await route.fulfill({ json: { ...(await response.json()), disks } });
+  });
+  await page.route("**/api/query?**", async (route) => {
+    const url = new URL(route.request().url());
+    const keys = url.searchParams.get("keys") ?? "";
+    queries.push(keys);
+    if (!keys.includes("disk.device_read:")) return route.continue();
+    const to = Number(url.searchParams.get("to"));
+    const ts = [to - 30, to - 15, to];
+    const selected = keys.includes("disk.device_read:external") ? "external" : "internal";
+    const read = selected === "external" ? 2 * 1024 ** 2 : 1024 ** 2;
+    await route.fulfill({ json: { from: to - 30, to, ts, step: 15, interval: 15, series: {
+      [`disk.device_read:${selected}`]: { avg: ts.map(() => read), min: ts.map(() => 0), max: ts.map(() => read * 2) },
+      [`disk.device_write:${selected}`]: { avg: ts.map(() => 1024), min: ts.map(() => 0), max: ts.map(() => 2048) },
+    } } });
+  });
+  await page.addInitScript(() => {
+    (window as any).EventSource = class extends EventTarget {
+      constructor() { super(); (window as any).diskSource = this; }
+      close() {}
+    };
+  });
+  await page.goto("/");
+  await expect(page.locator("#status")).toContainText("Updated");
+  await expect(page.getByLabel("Live disk", { exact: true })).toHaveValue("");
+  await expect(page.getByLabel("Historical disk", { exact: true })).toHaveValue("");
+  await page.locator("#live-toggle").check();
+  const emit = (type: string, data: unknown) => page.evaluate(({ type, data }) => {
+    (window as any).diskSource.dispatchEvent(new MessageEvent(type, { data: JSON.stringify(data) }));
+  }, { type, data });
+  const keys = ["disk.read", "disk.write", "disk.device_read:internal", "disk.device_write:internal", "disk.device_read:external", "disk.device_write:external"];
+  const values = [3 * 1024 ** 2, 1024 ** 2, 1024 ** 2, 256 * 1024, 2 * 1024 ** 2, 768 * 1024];
+  await emit("init", { disks, keys, rows: [[Date.now() - 2000, values], [Date.now(), values]], groups: [], groups_ts: null, sample_ms: 2000, process_sample_secs: 5 });
+  await expect(page.locator("#live-rate-disk-0")).toHaveText("3.00 MB/s");
+  await page.getByLabel("Live disk", { exact: true }).selectOption("external");
+  await expect(page.locator("#live-rate-disk-0")).toHaveText("2.00 MB/s");
+  await expect(page.locator("#live-rate-disk-1")).toHaveText("768 KB/s");
+  await page.getByLabel("Live disk", { exact: true }).selectOption("internal");
+  await expect(page.locator("#live-rate-disk-0")).toHaveText("1.00 MB/s");
+  await page.getByLabel("Live disk", { exact: true }).selectOption("external");
+  await emit("disks", { disks: disks.map((d) => ({ ...d, connected: d.id === "internal" })) });
+  await expect(page.getByLabel("Live disk", { exact: true })).toHaveValue("external");
+  await expect(page.locator("#live-rate-disk-0")).toHaveText("–");
+  await expect(page.locator("#live-sub-disk")).toContainText("Disconnected");
+  await page.getByLabel("Live disk", { exact: true }).selectOption("");
+  await expect(page.locator("#live-rate-disk-0")).toHaveText("3.00 MB/s");
+  await emit("disks", { disks: disks.map((d) => ({ ...d, bsd: d.id === "external" ? "disk9" : d.bsd })) });
+  await page.getByLabel("Live disk", { exact: true }).selectOption("external");
+  await expect(page.locator("#live-disk option:checked")).toContainText("disk9");
+  await page.getByLabel("Historical disk", { exact: true }).selectOption("external");
+  await expect.poll(() => queries.some((keys) => keys.includes("disk.device_read:external"))).toBe(true);
+  await expect(page.locator("#card-disk .legend-value").first()).toHaveText("2.00 MB/s");
+  await expect(page.locator("#card-disk .help")).toContainText("history starts");
+  await expect(page.getByLabel("Live disk", { exact: true })).toHaveValue("external");
+  await page.getByLabel("Historical disk", { exact: true }).selectOption("internal");
+  await expect(page.locator("#card-disk .legend-value").first()).toHaveText("1.00 MB/s");
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.locator("#live-toggle").uncheck();
+  expect(errors).toEqual([]);
 });
 
 test("live layout fits a mobile viewport", async ({ page }) => {
@@ -412,6 +500,11 @@ test("API: query, summary, events and Prometheus export", async ({ request }) =>
   expect(metrics).toContain("# TYPE mac_monitor_mem_used_bytes gauge");
   const meta = await (await request.get("/api/meta")).json();
   expect(meta.keys).toContain("mem.used");
+  expect(meta.disks.some((d: any) => d.connected)).toBe(true);
+  const disk = meta.disks.find((d: any) => d.connected);
+  expect(meta.keys).toContain(`disk.device_read:${disk.id}`);
+  const perDisk = await (await request.get(`/api/query?keys=disk.device_read:${disk.id}&from=${now - 600}&to=${now}`)).json();
+  expect(perDisk.series[`disk.device_read:${disk.id}`].avg.some((v: any) => v != null)).toBe(true);
   expect(meta.sample_ms).toBe(2000);
   expect(meta.live_sample_ms).toBe(meta.sample_ms);
   const bad = await request.get("/api/query?keys=power.sys&step=-5");

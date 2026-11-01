@@ -34,16 +34,30 @@ no runtime, no database server, no sudo.
   year (both configurable), in one compressed SQLite file.
 - **Live workspace.** Current CPU, memory, GPU, disk, network and power, with mini-charts for
   the last 1, 2, 5 or 15 minutes and a sortable current process-group table. Filled mini-charts
-  show CPU/GPU against 0–100%, memory against physical RAM, and labeled rate/power scales.
+  show CPU/GPU against 0–100%, RAM plus swap against a faint physical-RAM reference (value on hover), and labeled rate/power scales.
+  The live **RAM + swap** card adds RAM in use and swap in use as a combined footprint indicator,
+  with the two readings and memory pressure shown separately. The physical-RAM marker is
+  drawn behind the time series without an on-chart text label. The chart can extend above
+  physical RAM. Swap is disk-backed; this sum is not RAM usage or a memory-pressure percentage.
   Disk and network use compact mirrored directional areas around zero, with an Overlay option
   for comparison. Both use a trailing 6-second average and a shared scale. Current readings
   stay unsmoothed, and all displayed magnitudes remain positive. Live updates are
   off by default on every page load. Enable them for streamed 2-second system samples and approximately
   5-second process scans over one Server-Sent Events connection. Hiding the tab pauses its live
   connection; process scanning returns to normal once the last live viewer disconnects.
+- **Disk selector.** Live and historical disk throughput default to **All disks**. Choose an
+  individual internal/external device or disk image from the card's dropdown. Discovery runs
+  every minute; changing the selection reuses collected data. Each device adds two ordinary
+  avg/min/max history series at the existing 15-second/5-minute resolutions. Per-device history
+  begins with this version; older history remains combined. The Disk free summary still covers
+  the startup Data volume only. Stable hardware identifiers are hashed; devices without one
+  get attachment-scoped identifiers to avoid attributing a reused `diskN` name to another drive.
 - **Independent history.** Historical ranges and their summary cards, charts, process averages,
   peaks and events remain available below the live workspace. Changing a historical range does
   not stop Live or change its chart window.
+- **Process-table emphasis.** Soft data bars compare resource consumers within each column.
+  Scales use the full snapshot/range, so filtering does not rescale them; process counts remain
+  plain. Bars are relative comparisons, not machine-capacity or stress indicators.
 - **Dashboard UX.** Time presets from 15 minutes to a year, custom ranges, drag to zoom, a
   crosshair synced across all charts, legends that read out values, table view and CSV export
   for every chart, light and dark themes. Historical time-series use thin outlines and subtle
@@ -204,6 +218,7 @@ Every sample (stored as avg/min/max per 15 s):
 | `temp.cpu`, `temp.gpu`, `fan.rpm:<fan>`, `thermal.pressure` | Temperatures, fans, macOS thermal pressure level |
 | `mem.used`, `mem.app`, `mem.wired`, `mem.compressed`, `mem.cached`, `mem.free`, `mem.total`, `mem.pressure` | Memory breakdown and pressure level |
 | `swap.used`, `swap.total`, `swap.in`, `swap.out` | Swap use and traffic |
+| `disk.device_read:<id>`, `disk.device_write:<id>` | Per-device disk throughput; device names and connection status are in `/api/meta.disks` |
 | `disk.read`, `disk.write`, `net.rx`, `net.tx`, `load.1` | Throughput (all block devices; `en*` interfaces) and load |
 
 System samples remain in RAM for 15 minutes (at the shared 2-second cadence), and are
@@ -230,7 +245,7 @@ All times are unix seconds.
 | `GET /api/summary?keys=&match=&from=&to=` | Per key: `avg`, `min`, `max`, `integral` (value-seconds; joules for watts), `cov`, `last` |
 | `GET /api/events?from=&to=` | Event log |
 | `GET /api/meta` | Machine info, settings, known series |
-| `GET /api/live` | Server-Sent Events: `init` (last 15 minutes of system samples, latest process groups, and sampling cadences), then `row` every system sample and `groups` after each process scan |
+| `GET /api/live` | Server-Sent Events: `init` (last 15 minutes of system samples, latest process groups, and sampling cadences), then `row` every system sample, `groups` after each process scan, and `disks` when device discovery changes |
 | `GET /api/health` | Liveness |
 | `GET /metrics` | Latest values in Prometheus text format, e.g. `mac_monitor_power_sys_watts` |
 
