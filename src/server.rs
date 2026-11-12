@@ -57,6 +57,7 @@ pub fn router(app: App) -> Router {
     .route("/api/events", get(events))
     .route("/api/live", get(live))
     .route("/api/health", get(health))
+    .route("/api/current", get(current))
     .route("/metrics", get(metrics))
     .fallback(get(asset))
     .with_state(app)
@@ -203,6 +204,13 @@ async fn meta(State(app): State<App>) -> Json<Value> {
     "families": families,
     "disks": *app.shared.disks.lock().unwrap(),
   }))
+}
+
+async fn current(State(app): State<App>) -> Response {
+  let snapshot = crate::current::Snapshot::from_live(&app.shared.live.lock().unwrap(), app.settings.sample_ms);
+  let mut response = Json(snapshot).into_response();
+  response.headers_mut().insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+  response
 }
 
 async fn health(State(app): State<App>) -> Json<Value> {

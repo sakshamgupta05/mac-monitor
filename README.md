@@ -36,7 +36,8 @@ no runtime, no database server, no sudo.
   the last 1, 2, 5 or 15 minutes and a sortable current process-group table. Filled mini-charts
   show CPU/GPU against 0–100%, RAM plus swap against a faint physical-RAM reference (value on hover), and labeled rate/power scales.
   The live **RAM + swap** card adds RAM in use and swap in use as a combined footprint indicator,
-  with the two readings and memory pressure shown separately. The physical-RAM marker is
+  with the two readings, RAM utilization, memory breakdown and memory pressure shown separately.
+  Live memory readouts use the latest sample together; missing readings display as unknown. The physical-RAM marker is
   drawn behind the time series without an on-chart text label. The chart can extend above
   physical RAM. Swap is disk-backed; this sum is not RAM usage or a memory-pressure percentage.
   Disk and network use compact mirrored directional areas around zero, with an Overlay option
@@ -206,6 +207,77 @@ ignored. `/api/meta.live_sample_ms` remains a compatibility alias of `sample_ms`
 
 The electricity price for the cost figures is set in the dashboard (stored in the browser).
 
+## Query current metrics from the CLI
+
+Use `current` to read **one latest system sample** from the running monitor. It does not query
+historical averages, start another collector, open a stream, or enable accelerated process scans.
+The server must already be running (`mac-monitor status` checks it).
+
+```sh
+mac-monitor current                         # table of all available system metric keys
+mac-monitor current --keys mem.used,mem.total,mem.pressure,swap.used
+mac-monitor current --keys cpu.active,gpu.active,power.sys,disk.read,net.rx
+mac-monitor current --json                   # one JSON object, suitable for scripts
+mac-monitor current --keys mem.used,swap.used --json
+mac-monitor current --help
+```
+
+`--keys` accepts comma-separated **exact** metric keys from the table output or the
+[series reference](#what-is-recorded). Unknown keys fail instead of silently returning nothing.
+The command reports system metrics collected at `sample_ms` (normally every 2 seconds), matching
+the Live cards. It does not include the separately sampled process table or storage-only
+metrics such as `disk.free`, `disk.total`, `self.*`, and `procs.count`.
+
+The table shows raw values and their units. JSON has the following fields:
+
+| Field | Meaning |
+|---|---|
+| `timestamp_ms` | Unix **milliseconds** when the system sample was collected |
+| `age_ms` | Age of that sample in milliseconds at the server when requested |
+| `sample_ms` | Configured system sampling interval in milliseconds |
+| `metrics` | Object mapping metric keys to raw numeric values, or `null` if missing from this sample |
+| `units` | Object mapping the same keys to their units |
+
+Values come from the same system sample; an unavailable sensor is never backfilled from an
+older sample. Before the first sample, the command exits with an error. By default it also
+rejects samples older than **30 seconds**. Set `--max-age <seconds>` to use a different freshness
+limit, for example `mac-monitor current --max-age 5 --json`. Connection failures, invalid
+responses, unknown keys, and freshness failures exit nonzero with a diagnostic on stderr and
+no snapshot on stdout. Successful queries exit zero. A successful snapshot can still contain
+`null` readings; scripts should check any required values.
+
+Memory values are bytes (`B`), rates are bytes/second (`B/s`), power is watts (`W`), and CPU/GPU
+ratios run from 0 to 1 (multiply by 100 for percent). `mem.pressure` is 0 normal, 1 warning,
+2 critical. `mem.used` includes app + wired + physical compressed RAM; cached files are
+reclaimable and are excluded. `swap.used` is disk-backed swap and is reported separately.
+The dashboard's RAM + swap headline is `mem.used + swap.used`, not a RAM utilization percentage.
+For example, with the optional `jq` utility:
+
+```sh
+# RAM used in GiB (1024^3 bytes)
+mac-monitor current --json | jq '.metrics["mem.used"] / 1073741824'
+# RAM utilization, requiring both readings to be available
+mac-monitor current --keys mem.used,mem.total --json | jq -e '
+  .metrics | if .["mem.used"] != null and .["mem.total"] > 0
+  then 100 * .["mem.used"] / .["mem.total"] else error("RAM unavailable") end'
+```
+
+The server address defaults to `listen` in the config file. `--listen` (or
+`MAC_MONITOR_LISTEN`) overrides it for this query only; it accepts `host:port` or `[IPv6]:port`,
+not a URL. Wildcard bind addresses (`0.0.0.0` or `[::]`) are automatically queried through
+loopback on the server machine. From another device with the binary installed, use the
+monitor's reachable hostname:
+
+```sh
+mac-monitor current --no-config --listen mac-mini.tail213689.ts.net:9393 --json
+```
+
+`--config <path>`, `MAC_MONITOR_CONFIG`, and `--no-config` work as with other commands.
+The HTTP equivalent is `GET /api/current`, returning the same JSON snapshot with
+`Cache-Control: no-store`. Unlike the CLI, the endpoint leaves freshness policy to its caller;
+`timestamp_ms` and `age_ms` are `null` until the first sample. An older server must be upgraded
+and restarted before this command can query it.
+
 ## What is recorded
 
 Every sample (stored as avg/min/max per 15 s):
@@ -237,7 +309,7 @@ storage tier or retention policy.
 
 ## API
 
-All times are unix seconds.
+Historical API times are Unix seconds. `/api/current` and live system row timestamps use Unix milliseconds.
 
 | Endpoint | |
 |---|---|
@@ -246,6 +318,7 @@ All times are unix seconds.
 | `GET /api/events?from=&to=` | Event log |
 | `GET /api/meta` | Machine info, settings, known series |
 | `GET /api/live` | Server-Sent Events: `init` (last 15 minutes of system samples, latest process groups, and sampling cadences), then `row` every system sample, `groups` after each process scan, and `disks` when device discovery changes |
+| `GET /api/current` | One latest system sample: `timestamp_ms`, `age_ms`, `sample_ms`, `metrics`, `units`; no history or streaming. See [CLI queries](#query-current-metrics-from-the-cli) |
 | `GET /api/health` | Liveness |
 | `GET /metrics` | Latest values in Prometheus text format, e.g. `mac_monitor_power_sys_watts` |
 

@@ -181,6 +181,53 @@ test("live snapshots replace exited groups; sorting, filters, pause and visibili
   await expect(table).toContainText("Paused");
 });
 
+test("live memory uses one current sample and exposes the same breakdown as history", async ({ page }) => {
+  await page.addInitScript(() => {
+    (window as any).EventSource = class extends EventTarget {
+      constructor() { super(); (window as any).memorySource = this; }
+      close() {}
+    };
+  });
+  await page.goto("/");
+  await page.locator("#live-toggle").check();
+  await page.evaluate(() => {
+    const g = 1024 ** 3;
+    const source = (window as any).memorySource;
+    source.dispatchEvent(new Event("open"));
+    source.dispatchEvent(new MessageEvent("init", { data: JSON.stringify({
+      keys: ["mem.used", "swap.used", "mem.total", "mem.pressure", "mem.app", "mem.wired", "mem.compressed", "mem.cached", "mem.free"],
+      sample_ms: 2000, process_sample_secs: 5, groups: [], groups_ts: null,
+      rows: [[Date.now() - 2000, [26*g, 6*g, 32*g, 1, 12*g, 5*g, 9*g, 5*g, g]],
+             [Date.now(), [27*g, 6*g, 32*g, 0, 12*g, 5*g, 10*g, 4*g, g]]],
+    }) }));
+  });
+  await expect(page.locator("#live-value-mem")).toHaveText("33.0 GB");
+  await expect(page.locator("#live-sub-mem")).toContainText("84% of physical");
+  await expect(page.locator("#live-sub-mem")).toContainText("Normal pressure");
+  await page.locator("#live-metric-mem summary").click();
+  await expect(page.locator("#live-memory-breakdown")).toBeVisible();
+  await expect(page.locator("#live-memory-breakdown")).toHaveText("App 12.0 GB · Wired 5.00 GB · Compressed 10.0 GB · Cached 4.00 GB · Free 1.00 GB");
+  // Missing swap/pressure must not be borrowed from the preceding row.
+  await page.evaluate(() => {
+    (window as any).memorySource.dispatchEvent(new MessageEvent("row", { data: JSON.stringify({
+      t: Date.now() + 2000, v: [28 * 1024 ** 3, null, 32 * 1024 ** 3, null],
+    }) }));
+  });
+  await expect(page.locator("#live-value-mem")).toHaveText("–");
+  await expect(page.locator("#live-sub-mem")).toContainText("RAM 28.0 GB · Swap –");
+  await expect(page.locator("#live-sub-mem")).not.toContainText("Normal pressure");
+  await expect(page.locator("#live-memory-breakdown")).toHaveText("App – · Wired – · Compressed – · Cached – · Free –");
+  // Zero swap is a valid measurement, distinct from an unavailable measurement.
+  await page.evaluate(() => {
+    (window as any).memorySource.dispatchEvent(new MessageEvent("row", { data: JSON.stringify({
+      t: Date.now() + 4000, v: [28 * 1024 ** 3, 0, 32 * 1024 ** 3, 1],
+    }) }));
+  });
+  await expect(page.locator("#live-value-mem")).toHaveText("28.0 GB");
+  await expect(page.locator("#live-sub-mem")).toContainText("Swap 0 B");
+  await expect(page.locator("#live-sub-mem")).toContainText("Warning pressure");
+});
+
 test("live area charts retain CPU/GPU scales and allow RAM plus swap beyond physical RAM", async ({ page }) => {
   await page.addInitScript(() => {
     (window as any).EventSource = class extends EventTarget {

@@ -120,6 +120,19 @@ fn describe_disk(driver: &IoObject) -> DiskInfo {
   DiskInfo { id, name, bsd, kind, connected: true }
 }
 
+/// Physical bytes, not the uncompressed size of pages stored in the compressor.
+/// Purgeable pages are already included in anonymous pages; classify them as cache once.
+fn memory_values(vm: &libc::vm_statistics64, page: u64) -> [(&'static str, u64); 6] {
+  let app = (vm.internal_page_count as u64).saturating_sub(vm.purgeable_count as u64) * page;
+  let wired = vm.wire_count as u64 * page;
+  let compressed = vm.compressor_page_count as u64 * page;
+  let cached = (vm.external_page_count as u64 + vm.purgeable_count as u64) * page;
+  // Speculative pages are already counted as file-backed cache.
+  let free = (vm.free_count as u64).saturating_sub(vm.speculative_count as u64) * page;
+  [("mem.app", app), ("mem.wired", wired), ("mem.compressed", compressed),
+   ("mem.cached", cached), ("mem.free", free), ("mem.used", app + wired + compressed)]
+}
+
 pub struct Host {
   host_port: libc::mach_port_t,
   page_size: u64,
@@ -165,23 +178,24 @@ impl Host {
 
     if let Some(vm) = self.vm_stats() {
       let page = self.page_size;
-      let app = (vm.internal_page_count as u64).saturating_sub(vm.purgeable_count as u64) * page;
-      let wired = vm.wire_count as u64 * page;
-      let compressed = vm.compressor_page_count as u64 * page;
-      let cached = (vm.external_page_count as u64 + vm.purgeable_count as u64) * page;
-      let free = (vm.free_count as u64).saturating_sub(vm.speculative_count as u64) * page;
-      push("mem.app", app as f32);
-      push("mem.wired", wired as f32);
-      push("mem.compressed", compressed as f32);
-      push("mem.cached", cached as f32);
-      push("mem.free", free as f32);
-      push("mem.used", (app + wired + compressed) as f32);
+      for (key, value) in memory_values(&vm, page) {
+        push(key, value as f32);
+      }
       if let Some(r) = self.swap_in.update(now, vm.swapins) {
         push("swap.in", r * page as f32);
       }
       if let Some(r) = self.swap_out.update(now, vm.swapouts) {
         push("swap.out", r * page as f32);
       }
+    }
+
+    // Keep RAM, swap and pressure in the host sample, independent of power sensor success.
+    if let Some(total) = sysctl_raw::<u64>("hw.memsize") {
+      push("mem.total", total as f32);
+    }
+    if let Some(swap) = sysctl_raw::<libc::xsw_usage>("vm.swapusage") {
+      push("swap.used", swap.xsu_used as f32);
+      push("swap.total", swap.xsu_total as f32);
     }
 
     // 1 normal, 2 warning, 4 critical
@@ -345,6 +359,33 @@ mod tests {
   use super::*;
 
   #[test]
+  fn memory_accounts_for_cache_and_physical_compressor_without_double_counting() {
+    for page in [4096, 16384] {
+      let mut vm: libc::vm_statistics64 = unsafe { mem::zeroed() };
+      vm.internal_page_count = 700;
+      vm.purgeable_count = 100;
+      vm.wire_count = 200;
+      vm.compressor_page_count = 300;
+      vm.total_uncompressed_pages_in_compressor = 900;
+      vm.external_page_count = 400;
+      vm.free_count = 150;
+      vm.speculative_count = 50;
+      let values: HashMap<_, _> = memory_values(&vm, page).into_iter().collect();
+      assert_eq!(values["mem.app"], 600 * page);
+      assert_eq!(values["mem.compressed"], 300 * page);
+      assert_eq!(values["mem.cached"], 500 * page);
+      assert_eq!(values["mem.free"], 100 * page);
+      assert_eq!(values["mem.used"], 1100 * page);
+      assert_eq!(values["mem.used"] + values["mem.cached"] + values["mem.free"], 1700 * page);
+      vm.purgeable_count = 800;
+      vm.speculative_count = 200;
+      let values: HashMap<_, _> = memory_values(&vm, page).into_iter().collect();
+      assert_eq!(values["mem.app"], 0);
+      assert_eq!(values["mem.free"], 0);
+    }
+  }
+
+  #[test]
   fn rate_needs_two_samples_and_ignores_resets() {
     let mut r = Rate::default();
     let t = Instant::now();
@@ -373,7 +414,7 @@ mod tests {
     host.sample(&mut out);
     host.sample_slow(&mut out);
     let keys: Vec<&str> = out.iter().map(|(k, _)| k.as_str()).collect();
-    for k in ["mem.used", "mem.wired", "mem.pressure", "load.1", "disk.read", "net.rx", "disk.free"] {
+    for k in ["mem.used", "mem.wired", "mem.total", "swap.used", "swap.total", "mem.pressure", "load.1", "disk.read", "net.rx", "disk.free"] {
       assert!(keys.contains(&k), "missing {k} in {keys:?}");
     }
     for (total, family) in [("disk.read", "disk.device_read:"), ("disk.write", "disk.device_write:")] {

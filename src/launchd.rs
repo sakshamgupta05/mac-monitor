@@ -128,7 +128,7 @@ pub fn restart() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Where to reach a listen address from this machine (a wildcard address means loopback works).
-fn local_addr(listen: &str) -> String {
+pub(crate) fn local_addr(listen: &str) -> String {
   if let Some(port) = listen.strip_prefix("0.0.0.0:") {
     format!("127.0.0.1:{port}")
   } else if let Some(port) = listen.strip_prefix("[::]:") {

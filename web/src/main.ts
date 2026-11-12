@@ -761,7 +761,7 @@ function renderLive(): void {
         if (!diskCatalog.some((d) => d.id === liveDisk && d.connected)) return null;
         return liveRows[liveRows.length - 1]?.[1][liveKeys.indexOf(key)] ?? null;
       }
-      return liveValue(key);
+      return def.id === "mem" ? liveMemoryValue(key) : liveValue(key);
     };
     const v = value(keys[0]);
     let text = F.fmt(def.unit, v);
@@ -770,7 +770,9 @@ function renderLive(): void {
       const ram = value("mem.used");
       const swap = value("swap.used");
       text = F.fmt("B", ram != null && swap != null ? ram + swap : null);
-      sub = `RAM ${F.fmt("B", ram)} · Swap ${F.fmt("B", swap)}${value("mem.pressure") == null ? "" : ` · ${["Normal", "Warning", "Critical"][Math.min(2, Math.round(value("mem.pressure")!))]} pressure`}`;
+      const physical = value("mem.total");
+      const percent = ram != null && physical != null && physical > 0 ? ` · RAM ${F.pct(ram / physical)} of physical` : "";
+      sub = `RAM ${F.fmt("B", ram)} · Swap ${F.fmt("B", swap)}${percent}${value("mem.pressure") == null ? " · Pressure unavailable" : ` · ${["Normal", "Warning", "Critical"][Math.min(2, Math.round(value("mem.pressure")!))]} pressure`}`;
     } else if (def.keys.length === 2) {
       const a = value(keys[0]);
       const b = value(keys[1]);
@@ -782,6 +784,12 @@ function renderLive(): void {
     if (def.keys.length === 1) $(`live-value-${def.id}`).textContent = text;
     if (def.id === "disk" && liveDisk && !diskCatalog.some((d) => d.id === liveDisk && d.connected)) sub = "Disconnected · recent samples retained";
     $(`live-sub-${def.id}`).textContent = sub;
+    if (def.id === "mem") {
+      $("live-memory-breakdown").textContent = [
+        ["App", "mem.app"], ["Wired", "mem.wired"], ["Compressed", "mem.compressed"],
+        ["Cached", "mem.cached"], ["Free", "mem.free"],
+      ].map(([label, key]) => `${label} ${F.fmt("B", value(key))}`).join(" · ");
+    }
     const lines = keys.map((key, i) => ({ label: def.labels[i], color: slot(i), values: rows.map((r) => r[1][liveKeys.indexOf(key)] ?? null) }));
     if (def.id === "mem") {
       const ramIndex = liveKeys.indexOf("mem.used");
@@ -866,6 +874,12 @@ function updateDiskCatalog(disks: DiskInfo[]): void {
   }
 }
 
+/** Memory readings must refer to the same current sample as the plotted sum.
+ * A failed read stays unknown instead of silently reusing an older measurement. */
+function liveMemoryValue(key: string): number | null {
+  return liveRows[liveRows.length - 1]?.[1][liveKeys.indexOf(key)] ?? null;
+}
+
 function liveValue(key: string): number | null {
   const i = liveKeys.indexOf(key);
   if (i < 0) return null;
@@ -904,6 +918,12 @@ function buildLiveLayout(root: HTMLElement): void {
     if (p.id === "mem") plot.title = "RAM in use plus disk-backed swap. The reference marks physical RAM; this sum is not RAM usage or memory pressure.";
     const paired = p.keys.length === 2;
     grid.append(h("article", { class: `live-metric${paired ? " directional" : ""}`, id: `live-metric-${p.id}` }, p.id === "disk" ? h("div", { class: "live-metric-title" }, h("h3", {}, p.title), diskPicker("live")) : h("h3", {}, p.title), paired ? null : h("div", { class: "live-value", id: `live-value-${p.id}` }, "–"), h("p", { class: "help", id: `live-sub-${p.id}` }, "Waiting for live samples"), plot));
+    if (p.id === "mem") {
+      plot.after(h("details", { class: "help" }, h("summary", {}, "Memory breakdown"),
+        h("p", { id: "live-memory-breakdown" }, "Waiting for memory breakdown"),
+        h("p", {}, "RAM = app + wired + compressed. Cached files are reclaimable. Swap is on disk; RAM + swap is not a utilization percentage.")));
+
+    }
     const xRange = (): [number, number] => {
       const end = (liveRows[liveRows.length - 1]?.[0] ?? Date.now()) / 1000;
       return [end - liveWindow, end];
@@ -920,11 +940,11 @@ function buildLiveLayout(root: HTMLElement): void {
     } else {
       liveCharts.set(p.id, new Chart(plot, { unit: p.unit, compact: true, area: true, height: 110,
         tooltipExtra: p.id === "mem" ? () => {
-          const physical = liveValue("mem.total") ?? (meta.machine.memory_gb ? meta.machine.memory_gb * 1024 ** 3 : null);
+          const physical = liveMemoryValue("mem.total");
           return physical ? `Physical RAM: ${F.bytes(physical)}` : null;
         } : undefined,
         reference: p.id === "mem" ? () => {
-          const physical = liveValue("mem.total") ?? (meta.machine.memory_gb ? meta.machine.memory_gb * 1024 ** 3 : null);
+          const physical = liveMemoryValue("mem.total");
           return physical ? { value: physical, label: `${F.axis("B", physical)} RAM` } : null;
         } : undefined,
         y: p.unit === "ratio" ? "ratio" : "zero", xRange,

@@ -604,9 +604,6 @@ fn macmon_values(m: &macmon::Metrics, out: &mut Vec<(String, f32)>) {
   if let Some(t) = m.temp.gpu_temp_avg {
     push("temp.gpu", t);
   }
-  push("mem.total", m.memory.ram_total as f32);
-  push("swap.used", m.memory.swap_usage as f32);
-  push("swap.total", m.memory.swap_total as f32);
   for tier in &m.cpu_tiers {
     out.push((key("cpu.tier.active", &tier.label), tier.active_ratio));
     out.push((key("cpu.tier.scaled", &tier.label), tier.scaled_ratio));

@@ -1,6 +1,7 @@
 mod catalog;
 mod collector;
 mod config;
+mod current;
 mod launchd;
 mod server;
 mod store;
@@ -33,6 +34,23 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+  /// Query the latest system sample from the running server (no history or streaming)
+  Current {
+    #[command(flatten)]
+    file: ConfigArgs,
+    /// Server host:port (defaults to the configured listen address)
+    #[arg(long, env = "MAC_MONITOR_LISTEN")]
+    listen: Option<String>,
+    /// Comma-separated exact metric keys; omit to return all system metrics
+    #[arg(long, value_delimiter = ',')]
+    keys: Vec<String>,
+    /// Emit a JSON object with timestamps, raw values and units
+    #[arg(long)]
+    json: bool,
+    /// Fail if the latest system sample is older than this many seconds
+    #[arg(long, default_value_t = 30)]
+    max_age: u64,
+  },
   /// Record metrics and serve the dashboard (the default)
   Serve(ServeArgs),
   /// Install a LaunchAgent that runs `serve` at login; options given here are saved to the config file
@@ -105,6 +123,7 @@ fn main() {
   let cli = Cli::parse();
   let result = match cli.cmd {
     None => serve(cli.serve),
+    Some(Cmd::Current { file, listen, keys, json, max_age }) => current(file, listen, keys, json, max_age),
     Some(Cmd::Serve(args)) => serve(args),
     Some(Cmd::Install(args)) => install(args),
     Some(Cmd::Uninstall) => launchd::uninstall(),
@@ -169,6 +188,18 @@ fn status(file: ConfigArgs, listen: Option<String>) -> Result<(), Box<dyn std::e
     }
   };
   launchd::status(&listen)
+}
+
+fn current(file: ConfigArgs, listen: Option<String>, keys: Vec<String>, json: bool, max_age: u64) -> Result<(), Box<dyn std::error::Error>> {
+  let listen = listen.or(file.read()?.listen).unwrap_or_else(|| config::DEFAULT_LISTEN.into());
+  let mut snapshot = current::fetch(&listen)?;
+  snapshot.check_age(max_age)?;
+  let keys: Vec<_> = keys.into_iter().map(|k| k.trim().to_string()).collect();
+  if keys.iter().any(|key| key.is_empty()) { return Err("--keys must contain non-empty metric names".into()); }
+  snapshot.select(&keys)?;
+  if json { println!("{}", serde_json::to_string_pretty(&snapshot)?); }
+  else { print!("{}", snapshot.table()); }
+  Ok(())
 }
 
 fn serve(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
